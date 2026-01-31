@@ -52,30 +52,34 @@ def check_idor(
     ]
 
     # 3️⃣ Compare responses
-    for test_id in test_ids:
-        try:
-            test_response = send_request(test_id)
-        except Exception:
-            continue
+    from scanner.response_analyzer import analyze_json_response
 
-        if test_response.status_code == 200:
-            test_length = len(test_response.text)
+base_meta = analyze_json_response(base_response)
 
-            if test_length != base_length:
-                return {
-                    "vulnerability": "IDOR",
-                    "endpoint": endpoint,
-                    "risk_level": "HIGH",
-                    "description": "Possible Insecure Direct Object Reference detected.",
-                    "impact": "Unauthorized access to other users' resources.",
-                    "recommendation": (
-                        "Implement object-level authorization checks "
-                        "and validate ownership on every request."
-                    )
-                }
+for test_id in test_ids:
+    test_response = send_request(test_id)
+    if test_response.status_code != 200:
+        continue
 
-    return {
-        "vulnerability": "IDOR",
-        "status": "safe",
-        "message": "No IDOR behavior detected."
-  }
+    test_meta = analyze_json_response(test_response)
+
+    if test_meta["is_json"] and base_meta["is_json"]:
+        keys_diff = test_meta["keys"] - base_meta["keys"]
+        sensitive_diff = test_meta["sensitive_fields"]
+
+        if keys_diff or sensitive_diff:
+            return {
+                "vulnerability": "IDOR",
+                "endpoint": endpoint,
+                "risk_level": "HIGH",
+                "description": "Object-level authorization may be missing (IDOR).",
+                "impact": "Possible access to other users' sensitive data.",
+                "evidence": {
+                    "new_keys": list(keys_diff),
+                    "sensitive_fields": list(sensitive_diff)
+                },
+                "recommendation": (
+                    "Enforce object ownership checks and validate authorization "
+                    "for every object access."
+                )
+            }
