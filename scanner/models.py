@@ -22,3 +22,13 @@ class ApiResource:
 
     def __repr__(self):
         return f"<ApiResource {self.name} {self.endpoint}>"
+        # Example usage:
+#
+# user_resource = ApiResource(
+#     name="User",
+#     endpoint="/api/user/{id}",
+#     methods=["GET", "PUT", "DELETE"],
+#     owner_field="id",
+#     sensitive_fields=["role", "balance"],
+#     writable_fields=["name", "email"]
+# )
