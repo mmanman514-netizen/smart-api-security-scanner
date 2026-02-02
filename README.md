@@ -1,66 +1,81 @@
 # Smart API Security Scanner
 
-Smart API Security Scanner is an educational security tool designed to analyze REST APIs and detect common security vulnerabilities based on the OWASP API Security Top 10.
+Smart API Security Scanner is an **educational and defensive security tool** designed to analyze REST APIs and identify common security weaknesses based on the **OWASP API Security Top 10**.
 
-The project focuses on automated, non-destructive security checks that help developers and security learners understand how API vulnerabilities occur, how they can be identified, and how they should be mitigated.
-
-In addition to detection, the tool provides clear explanations of each vulnerability, its potential impact, and recommended remediation steps.  
-This project is built for learning purposes, portfolio development, and demonstrating real-world API security analysis skills.
+The project focuses on **automated, non-destructive testing** to help security learners and developers understand how API vulnerabilities occur, how they can be detected, and how they should be mitigated.
 
 ---
 
 ## 🎯 Project Goals
-- Learn API Security in a practical way
-- Understand OWASP API Security Top 10
-- Build a real security scanning tool
+
+- Learn API Security through hands-on practice
+- Understand real-world API vulnerabilities
+- Build a professional API security scanning tool
 - Create a strong cybersecurity portfolio project
 
 ---
 
-## 🔍 Planned Features
-- Automated REST API security scanning
-- Detection of common API vulnerabilities
-- Smart analysis of API responses
-- Clear vulnerability explanations
-- Risk level classification
-- Security recommendations (mitigation)
-- Report generation (text / markdown)
+## 🔍 What This Tool Scans
 
----
+The scanner focuses on common API security issues, including:
 
-## 🛡️ Targeted Vulnerabilities (OWASP API Top 10)
-- Broken Object Level Authorization (IDOR)
-- Broken Authentication
-- Excessive Data Exposure
-- Lack of Rate Limiting
+- Broken Object Level Authorization (BOLA / IDOR)
+- Broken Function Level Authorization (BFLA)
 - Mass Assignment
-- Security Misconfiguration
-- Injection (basic level)
+- Excessive Data Exposure
+- Broken Authentication (basic checks)
+- Lack of Rate Limiting (basic detection)
+- Security Misconfiguration (basic level)
+
+All tests are designed to be **safe and non-destructive**.
 
 ---
 
-## ⚠️ Ethical Use Disclaimer
-This project is intended for educational and learning purposes only.  
-Only scan APIs that you own or have explicit permission to test.  
-Unauthorized testing of third-party systems is strictly prohibited.
+## 🧠 How It Works (High-Level)
+
+1. Discover exposed API documentation (Swagger / OpenAPI)
+2. Parse endpoints, methods, and parameters
+3. Analyze authorization and object ownership logic
+4. Perform controlled security checks
+5. Analyze API responses intelligently
+6. Generate a clear security report with explanations and mitigations
 
 ---
 
-## 🗺️ Roadmap
-- Phase 1: Project structure and IDOR detection
-- Phase 2: Multiple vulnerability checks
-- Phase 3: Smart analysis and reporting
-- Phase 4: Advanced improvements (optional)
+## 🛠️ Technologies Used
 
----
-
-## 🛠️ Technologies
 - Python 3
 - REST APIs
 - JSON
+- OpenAPI / Swagger
 - Git & GitHub
 
 ---
 
-## 📌 Status
-🚧 Project is under active development.
+## ⚠️ Ethical Use Disclaimer
+
+This tool is intended **for educational and learning purposes only**.
+
+You must only scan:
+- APIs you own, or
+- APIs you have **explicit permission** to test
+
+Unauthorized testing of third-party systems is strictly prohibited.
+
+The author is not responsible for misuse of this tool.
+
+---
+
+## 🗺️ Project Roadmap
+
+- Phase 1: API discovery & BOLA detection
+- Phase 2: Multiple vulnerability scanners
+- Phase 3: Smart response analysis & reporting
+- Phase 4: Advanced improvements (optional)
+
+---
+
+## 📌 Project Status
+
+🚧 Under active development  
+Contributions and learning feedback are welcome.
