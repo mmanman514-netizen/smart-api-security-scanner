@@ -1,0 +1,30 @@
+{
+  "target": "http://127.0.0.1:5000",
+
+  "auth": {
+    "user_a": {
+      "headers": {
+        "Authorization": "Bearer TOKEN_USER_A"
+      }
+    },
+    "user_b": {
+      "headers": {
+        "Authorization": "Bearer TOKEN_USER_B"
+      }
+    }
+  },
+
+  "resources": [
+    {
+      "name": "User Profile",
+      "endpoint": "/api/user/{id}",
+      "methods": ["GET"],
+      "owner_field": "id"
+    }
+  ],
+
+  "scan": {
+    "type": "bola",
+    "object_ids": [1]
+  }
+}
