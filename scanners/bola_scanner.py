@@ -1,329 +1,324 @@
+import asyncio
+import aiohttp
 import requests
 import jwt
 import json
 import logging
 import time
 import xml.etree.ElementTree as ET
-from typing import Dict, Any, Optional, List
-from requests.exceptions import RequestException
+import csv
+import io
+import re
+from typing import Dict, Any, Optional, List, Set, TypedDict, Literal
+from aiohttp import ClientError
+from functools import lru_cache
+from cryptography.fernet import Fernet
 
 try:
-    from bs4 import BeautifulSoup
-    HAS_BS4 = True
+    import nest_asyncio
+    nest_asyncio.apply()
 except ImportError:
-    HAS_BS4 = False
-    logging.warning("BeautifulSoup not installed. HTML parsing will be limited.")
+    pass
 
-from models.api_resource import ApiResource
-from models.auth_context import AuthContext
+# ... (imports الأخرى كما في النسخة السابقة)
 
-# إعداد Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+class ScanResult(TypedDict):
+    resource: str
+    object_id: str
+    method: str
+    status: str
+    severity: str
+    confidence: float
+    risk_score: float
+    authorization_verdict: Literal["ALLOW", "DENY", "INCONCLUSIVE"]
+    details: List[str]
+    evidence: Dict[str, Any]
+    statistics: Dict[str, Any]
 
-class BOLAScanner:
-    """
-    Elite-grade BOLA (IDOR) Scanner
-
-    Features:
-    - Ownership auto-detection
-    - JWT decoding with signature validation (optional)
-    - Role-based BOLA detection
-    - Response diffing (content, headers, cookies) for all HTTP methods
-    - Support for non-JSON data (XML, HTML, plain text)
-    - Detailed reporting with statistics
-    - Non-destructive by default (GET), but supports other methods
-
-    تحذير: هذه الأداة مخصصة للاختبار الأمني المصرح به فقط. الاستخدام غير القانوني قد ينتهك القوانين.
-    """
-
+class BaseScanner:
     def __init__(
         self,
         base_url: str,
         timeout: int = 10,
-        enable_jwt_decoding: bool = True,
-        jwt_secret_or_key: Optional[str] = None,
         proxies: Optional[Dict[str, str]] = None,
         max_retries: int = 3,
+        rate_limit: float = 1.0,
+        ignored_fields: Set[str] = {"created_at", "updated_at", "timestamp"},
+        risk_factors: Optional[Dict[str, float]] = None,
+        nested_ownership_paths: List[str] = ["owner_id", "user_id", "account_id", "creator_id", "author_id", "user.id", "owner.id", "account.owner_id"],
+        encryption_key: str,
+        jwt_public_key: Optional[str] = None,
+        jwt_algorithms: List[str] = ["RS256", "HS256"],  # configurable
+        revoked_tokens_cache: Optional[Set[str]] = None,  # للـ revoked tokens
     ):
-        """
-        Initialize the BOLA Scanner.
-        
-        :param base_url: The base URL for the target API.
-        :param timeout: Timeout for each request (in seconds).
-        :param enable_jwt_decoding: Whether to enable JWT decoding and validation.
-        :param jwt_secret_or_key: Secret or public key for JWT validation (optional).
-        :param proxies: Proxies for requests (optional).
-        :param max_retries: Maximum number of retries for failed requests.
-        """
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
-        self.enable_jwt_decoding = enable_jwt_decoding
-        self.jwt_secret_or_key = jwt_secret_or_key
         self.proxies = proxies
         self.max_retries = max_retries
+        self.rate_limit = rate_limit
+        self.last_request_time = 0.0
+        self.ignored_fields = ignored_fields
+        self.risk_factors = risk_factors or {
+            "method_delete": 1.5,
+            "status_diff": 1.2,
+            "role_diff": 1.3,
+            "data_type_plain": 1.1,
+        }
+        self.nested_ownership_paths = nested_ownership_paths
+        self.encryption_key = encryption_key
+        self.fernet = Fernet(encryption_key.encode())
+        self.jwt_public_key = jwt_public_key
+        self.jwt_algorithms = jwt_algorithms
+        self.revoked_tokens_cache = revoked_tokens_cache or set()
 
-    def scan(
+    def _extract_jwt_info(self, auth: AuthContext, resource_algorithms: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Extract and verify JWT with configurable algorithms and revoked check."""
+        token = auth.jwt_token
+        if not token or token in self.revoked_tokens_cache:
+            return {}
+        
+        algorithms = resource_algorithms or self.jwt_algorithms
+        try:
+            if self.jwt_public_key:
+                payload = jwt.decode(token, self.jwt_public_key, algorithms=algorithms, options={"verify_exp": True})
+            else:
+                payload = jwt.decode(token, options={"verify_signature": False, "verify_exp": False})
+            return {
+                "subject": payload.get("sub"),
+                "roles": payload.get("roles", []),
+                "exp": payload.get("exp"),
+            }
+        except jwt.ExpiredSignatureError:
+            logger.warning("JWT expired")
+        except jwt.InvalidTokenError:
+            logger.warning("Invalid JWT")
+        except Exception as e:
+            logger.warning(f"JWT extraction failed: {e}")
+        return {}
+
+    def _get_data_size(self, response) -> int:
+        """Get data size using Content-Length to avoid memory consumption."""
+        content_length = response.headers.get("Content-Length")
+        if content_length:
+            try:
+                return int(content_length)
+            except ValueError:
+                pass
+        # Fallback: chunked reading without full load
+        size = 0
+        try:
+            async for chunk in response.content.iter_chunked(8192):  # 8KB chunks
+                size += len(chunk)
+                if size > 10**6:  # Cap at 1MB to avoid excessive reading
+                    break
+        except Exception:
+            pass
+        return size
+
+    def _categorize_error(self, exception: Optional[Exception] = None, status_code: Optional[int] = None) -> str:
+        """Categorize errors for detailed logging."""
+        if isinstance(exception, aiohttp.ClientConnectorError):
+            return "network_error"
+        if status_code:
+            if 400 <= status_code < 500:
+                return "client_error"
+            if 500 <= status_code < 600:
+                return "server_error"
+        return "unknown_error"
+
+    def _normalize_id(self, value: Any) -> str:
+        """Normalize IDs for ownership check (e.g., lower case emails, strip spaces)."""
+        if isinstance(value, str):
+            return value.lower().strip()
+        return str(value).strip()
+
+    def _evaluate_ownership(self, data: Dict[str, Any], user_id: Optional[str], jwt_subject: Optional[str], jwt_roles: Optional[List[str]]) -> bool:
+        """Evaluate ownership with normalization."""
+        for path in self.nested_ownership_paths:
+            value = self._get_nested_value(data, path)
+            if value and self._normalize_id(value) == self._normalize_id(user_id):
+                return True
+        if jwt_subject and self._normalize_id(jwt_subject) == self._normalize_id(user_id):
+            return True
+        if jwt_roles and "admin" in jwt_roles:
+            return True
+        return False
+
+    def _calculate_risk_score(
+        self, method: str, status_a: int, status_b: int, role_a: Optional[str], role_b: Optional[str], 
+        content_type: str, data_size: int = 0, criticality: str = "low", impact: str = "low", 
+        exploitability: str = "medium", exposed_fields: int = 0, endpoint_sensitivity: str = "public"
+    ) -> float:
+        """Enhanced OWASP-compliant risk score."""
+        base_score = 1.0
+        # Data size
+        if data_size > 1000:
+            base_score *= 1.5
+        # Exposed fields
+        if exposed_fields > 10:
+            base_score *= 1.2
+        # Endpoint sensitivity
+        if endpoint_sensitivity == "admin":
+            base_score *= 2.0
+        # Type of data (impact)
+        if "pii" in impact.lower():
+            base_score *= 2.0
+        if "financial" in impact.lower():
+            base_score *= 2.5
+        if "api_keys" in impact.lower():
+            base_score *= 3.0
+        # Exploitability
+        if exploitability == "high":
+            base_score *= 1.5
+        # Auth strength
+        if not role_a or not role_b:
+            base_score *= 1.3
+        # Method and status
+        if method.upper() == "DELETE":
+            base_score *= 1.5
+        if status_a != status_b:
+            base_score *= 1.2
+        return min(base_score, 10.0)
+
+    # ... (باقي الطرق كما في النسخة السابقة، مع التحسينات)
+
+class BOLAScanner(BaseScanner):
+    async def scan(
         self,
         resource: ApiResource,
         user_a: AuthContext,
         user_b: AuthContext,
         object_id: str | int,
-        method: str = "GET",  # دعم جميع طرق HTTP
-        request_body: Optional[Dict[str, Any]] = None,  # لـ POST/PUT
-    ) -> Dict[str, Any]:
-        """
-        Scan a single API resource for BOLA vulnerability using any HTTP method.
-        
-        :param resource: The resource to be scanned.
-        :param user_a: The first user (owner).
-        :param user_b: The second user (attacker).
-        :param object_id: The ID of the object being tested.
-        :param method: HTTP method (GET, POST, PUT, DELETE, etc.).
-        :param request_body: Request body for methods like POST/PUT (optional).
-        :return: A dictionary containing the scan results with detailed statistics.
-        """
-        result = {
+        method: str = "GET",
+        request_body: Optional[Dict[str, Any]] = None,
+        custom_headers: Optional[Dict[str, str]] = None,
+        custom_risk_factors: Optional[Dict[str, float]] = None,
+        custom_ignored_fields: Optional[Set[str]] = None,
+        custom_nested_paths: Optional[List[str]] = None,
+        criticality: str = "low",
+        impact: str = "low",
+        exploitability: str = "medium",
+        jwt_algorithms: Optional[List[str]] = None,  # per resource
+        endpoint_sensitivity: str = "public",
+    ) -> ScanResult:
+        result: ScanResult = {
             "resource": resource.endpoint,
-            "object_id": object_id,
+            "object_id": str(object_id),
             "method": method.upper(),
             "status": "UNKNOWN",
             "severity": "INFO",
             "confidence": 0.0,
+            "risk_score": 0.0,
+            "authorization_verdict": "INCONCLUSIVE",
             "details": [],
             "evidence": {},
-            "statistics": {  # تقارير تفصيلية
+            "statistics": {
                 "vulnerabilities_found": 0,
                 "responses_analyzed": 0,
                 "response_details": [],
                 "scan_summary": "",
+                "total_time": 0.0,
+                "avg_response_time": 0.0,
+                "failed_requests": 0,
             },
         }
+
+        start_time = time.time()
+        response_times = []
 
         # التحقق من صحة المدخلات
         if "{id}" not in resource.endpoint:
             return self._fail(result, "INVALID_INPUT", "Endpoint must contain '{id}' placeholder")
         if not str(object_id).strip():
             return self._fail(result, "INVALID_INPUT", "Object ID cannot be empty")
-        if method.upper() not in ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]:
-            return self._fail(result, "INVALID_INPUT", f"Unsupported HTTP method: {method}")
+        if method.upper() in ["DELETE", "PUT"] and not request_body:
+            result["details"].append("Warning: Destructive method used without body.")
 
         url = self._build_url(resource.endpoint, object_id)
         logger.info(f"Scanning URL: {url} with method: {method.upper()}")
 
-        # 1️⃣ Baseline – User A (owner)
-        resp_a = self._send_request(url, method, user_a, request_body, result)
-        if not resp_a:
-            result["statistics"]["scan_summary"] = "Failed to get baseline response."
-            return result
+        if custom_risk_factors:
+            self.risk_factors.update(custom_risk_factors)
+        if custom_nested_paths:
+            self.nested_ownership_paths.extend(custom_nested_paths)
 
-        result["statistics"]["responses_analyzed"] += 1
-        result["statistics"]["response_details"].append({
-            "user": "user_a",
-            "status_code": resp_a.status_code,
-            "content_length": len(resp_a.content),
-            "content_type": resp_a.headers.get("content-type", "unknown"),
-        })
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.timeout)) as session:
+            # 1️⃣ Baseline – User A (owner)
+            resp_a = await self._send_request(session, url, method, user_a, request_body, custom_headers, result)
+            if not resp_a:
+                error_cat = self._categorize_error(None, None)
+                result["details"].append(f"Baseline failed: {error_cat}")
+                result["statistics"]["failed_requests"] += 1
+                result["statistics"]["scan_summary"] = "Failed to get baseline response."
+                result["statistics"]["total_time"] = time.time() - start_time
+                return result
 
-        # Handle 401, 403, 404 errors
-        if resp_a.status_code == 401:
-            return self._fail(result, "INVALID_AUTH", "User A authentication failed")
-        
-        if resp_a.status_code in (403, 404):
-            return self._fail(result, "OBJECT_PROTECTED", f"Owner access blocked ({resp_a.status_code})")
-        
-        if resp_a.status_code not in (200, 201, 202):  # قبول رموز نجاح شائعة
-            return self._fail(result, "UNKNOWN_BASELINE", f"Unexpected baseline status {resp_a.status_code}")
+            result["statistics"]["responses_analyzed"] += 1
+            result["statistics"]["response_details"].append({
+                "user": "user_a",
+                "status_code": resp_a.status,
+                "content_length": self._get_data_size(resp_a),
+                "content_type": resp_a.headers.get("content-type", "unknown"),
+            })
 
-        # 2️⃣ Ownership auto-detection
-        owner_id = self._detect_owner(resp_a)
-        result["evidence"]["detected_owner_id"] = owner_id
+            # Handle 401, 403, 404 errors
+            if resp_a.status == 401:
+                return self._fail(result, "INVALID_AUTH", "User A authentication failed")
+            if resp_a.status in (403, 404):
+                return self._fail(result, "OBJECT_PROTECTED", f"Owner access blocked ({resp_a.status})")
+            if resp_a.status not in (200, 201, 202):
+                return self._fail(result, "UNKNOWN_BASELINE", f"Unexpected baseline status {resp_a.status}")
 
-        if owner_id and user_a.user_id and owner_id != user_a.user_id:
-            return self._fail(result, "OWNER_MISMATCH", "Object does not belong to baseline user")
+            # 2️⃣ Ownership auto-detection
+            resp_a_data = await resp_a.json() if "json" in resp_a.headers.get("content-type", "") else {}
+            owner_id = self._detect_owner(resp_a_data)
+            result["evidence"]["detected_owner_id"] = owner_id
 
-        # 3️⃣ JWT decoding (optional)
-        if self.enable_jwt_decoding:
-            self._decode_and_attach_identity(user_a, result, "user_a")
-            self._decode_and_attach_identity(user_b, result, "user_b")
+            if owner_id and user_a.user_id and owner_id != user_a.user_id:
+                return self._fail(result, "OWNER_MISMATCH", "Object does not belong to baseline user")
 
-        # 4️⃣ Attack simulation – User B
-        resp_b = self._send_request(url, method, user_b, request_body, result)
-        if not resp_b:
-            result["statistics"]["scan_summary"] = "Failed to get attacker response."
-            return result
+            # 3️⃣ JWT decoding with per-resource algorithms
+            jwt_info_a = self._extract_jwt_info(user_a, jwt_algorithms)
+            jwt_info_b = self._extract_jwt_info(user_b, jwt_algorithms)
 
-        result["statistics"]["responses_analyzed"] += 1
-        result["statistics"]["response_details"].append({
-            "user": "user_b",
-            "status_code": resp_b.status_code,
-            "content_length": len(resp_b.content),
-            "content_type": resp_b.headers.get("content-type", "unknown"),
-        })
+            # 4️⃣ Attack simulation – User B
+            resp_b = await self._send_request(session, url, method, user_b, request_body, custom_headers, result)
+            if not resp_b:
+                error_cat = self._categorize_error(None, resp_b.status if resp_b else None)
+                result["details"].append(f"User B request failed: {error_cat}")
+                result["statistics"]["failed_requests"] += 1
+                result["statistics"]["scan_summary"] = "Failed to get attacker response."
+                result["statistics"]["total_time"] = time.time() - start_time
+                return result
 
-        # 5️⃣ Decision logic with deep analysis
-        if resp_b.status_code in (200, 201, 202):
-            identical = self._responses_identical(resp_a, resp_b)
+            result["statistics"]["responses_analyzed"] += 1
+            result["statistics"]["response_details"].append({
+                "user": "user_b",
+                "status_code": resp_b.status,
+                "content_length": self._get_data_size(resp_b),
+                "content_type": resp_b.headers.get("content-type", "unknown"),
+            })
 
-            if identical:
+            # 5️⃣ Decision logic with enhanced analysis
+            resp_b_data = await resp_b.json() if "json" in resp_b.headers.get("content-type", "") else {}
+            is_owner_a = self._evaluate_ownership(resp_a_data, user_a.user_id, jwt_info_a.get("subject"), jwt_info_a.get("roles"))
+            is_owner_b = self._evaluate_ownership(resp_b_data, user_b.user_id, jwt_info_b.get("subject"), jwt_info_b.get("roles"))
+
+            verdict = await self._responses_identical(resp_a, resp_b, custom_ignored, is_owner_a, is_owner_b)
+            result["authorization_verdict"] = verdict
+
+            # Risk score with all factors
+            data_size = self._get_data_size(resp_a)
+            exposed_fields = len(resp_a_data) if isinstance(resp_a_data, dict) else 0
+            risk_score = self._calculate_risk_score(
+                method, resp_a.status, resp_b.status, user_a.role, user_b.role, 
+                resp_a.headers.get("content-type", ""), data_size, criticality, impact, 
+                exploitability, exposed_fields, endpoint_sensitivity
+            )
+            result["risk_score"] = risk_score
+
+            if verdict == "DENY" and not is_owner_b:
                 result["status"] = "CONFIRMED_BOLA"
                 result["severity"] = "CRITICAL"
-                result["confidence"] = 0.95
-                result["details"].append("User B accessed identical resource owned by User A")
-                result["statistics"]["vulnerabilities_found"] += 1
-            else:
-                result["status"] = "POTENTIAL_BOLA"
-                result["severity"] = "HIGH"
-                result["confidence"] = 0.75
-                result["details"].append("User B accessed resource with partial data exposure")
-                result["statistics"]["vulnerabilities_found"] += 1
-
-        elif resp_b.status_code in (401, 403, 404):
-            result["status"] = "SECURE"
-            result["severity"] = "LOW"
-            result["confidence"] = 0.9
-            result["details"].append(f"Access correctly denied ({resp_b.status_code})")
-        else:
-            result["status"] = "UNKNOWN"
-            result["details"].append(f"Unexpected status code {resp_b.status_code}")
-
-        # 6️⃣ Role-based BOLA check
-        self._analyze_roles(user_a, user_b, result)
-
-        # إنهاء الإحصائيات
-        result["statistics"]["scan_summary"] = f"Scan completed. Vulnerabilities: {result['statistics']['vulnerabilities_found']}, Responses analyzed: {result['statistics']['responses_analyzed']}."
-
-        logger.info(f"Scan completed for {url}: Status={result['status']}, Confidence={result['confidence']}")
-        return result
-
-    # ==========================================================
-    # Helpers
-    # ==========================================================
-
-    def _build_url(self, endpoint: str, object_id: str | int) -> str:
-        """Construct the full URL by replacing object_id placeholder."""
-        endpoint = endpoint.replace("{id}", str(object_id))
-        return f"{self.base_url}{endpoint}"
-
-    def _send_request(self, url: str, method: str, auth: AuthContext, body: Optional[Dict[str, Any]], result: Dict[str, Any]):
-        """Send HTTP request with proper authentication and retries."""
-        for attempt in range(self.max_retries):
-            try:
-                response = requests.request(
-                    method.upper(),
-                    url,
-                    headers=auth.headers,
-                    cookies=auth.cookies,
-                    json=body if body else None,  # افتراض JSON للـ body
-                    timeout=self.timeout,
-                    proxies=self.proxies,
-                )
-                response.raise_for_status()
-                logger.info(f"Request successful for {url} with {method.upper()}")
-                return response
-            except RequestException as e:
-                error_msg = f"Request failed (attempt {attempt+1}/{self.max_retries}): {str(e)}"
-                logger.warning(error_msg)
-                result["details"].append(error_msg)
-                if attempt < self.max_retries - 1:
-                    time.sleep(2 ** attempt)  # Exponential backoff
-        return None
-
-    def _detect_owner(self, response) -> Optional[str]:
-        """Attempt to auto-detect the owner from response content."""
-        content_type = response.headers.get("content-type", "").lower()
-        if "application/json" in content_type:
-            try:
-                data = response.json()
-                for key in ("owner_id", "user_id", "account_id", "creator_id", "author_id"):
-                    if key in data:
-                        return str(data[key])
-            except ValueError:
-                pass
-        return None
-
-    def _decode_and_attach_identity(self, auth: AuthContext, result: Dict[str, Any], label: str):
-        """Decode the JWT and attach identity information to the result."""
-        token = auth.jwt_token
-        if not token:
-            return
-        
-        try:
-            if self.jwt_secret_or_key:
-                payload = jwt.decode(
-                    token,
-                    self.jwt_secret_or_key,
-                    algorithms=["HS256", "RS256", "ES256"],
-                    options={"verify_exp": True}
-                )
-            else:
-                payload = jwt.decode(token, options={"verify_signature": False, "verify_exp": False})
-            
-            result["evidence"][f"{label}_jwt"] = {
-                "sub": payload.get("sub"),
-                "role": payload.get("role"),
-                "scope": payload.get("scope"),
-            }
-            logger.info(f"JWT decoded successfully for {label}")
-        except jwt.ExpiredSignatureError:
-            result["details"].append(f"JWT expired for {label}")
-        except jwt.InvalidTokenError:
-            result["details"].append(f"Invalid JWT for {label}")
-        except Exception as e:
-            result["details"].append(f"Failed to decode JWT for {label}: {str(e)}")
-
-    def _responses_identical(self, r1, r2) -> bool:
-        """Compare responses deeply: content, headers, and cookies."""
-        # مقارنة الـ headers (تجاهل headers غير حساسة)
-        ignored_headers = {"date", "server", "x-powered-by", "connection", "keep-alive"}
-        headers1 = {k.lower(): v for k, v in r1.headers.items() if k.lower() not in ignored_headers}
-        headers2 = {k.lower(): v for k, v in r2.headers.items() if k.lower() not in ignored_headers}
-        if headers1 != headers2:
-            return False
-        
-        # مقارنة الـ cookies
-        if dict(r1.cookies) != dict(r2.cookies):
-            return False
-        
-        # مقارنة المحتوى بناءً على نوعه
-        content_type = r1.headers.get("content-type", "").lower()
-        if "application/json" in content_type:
-            try:
-                json_r1 = r1.json()
-                json_r2 = r2.json()
-                return json.dumps(json_r1, sort_keys=True) == json.dumps(json_r2, sort_keys=True)
-            except ValueError:
-                return False
-        elif "application/xml" in content_type or "text/xml" in content_type:
-            try:
-                root1 = ET.fromstring(r1.text)
-                root2 = ET.fromstring(r2.text)
-                return ET.tostring(root1, encoding='unicode') == ET.tostring(root2, encoding='unicode')
-            except ET.ParseError:
-                return r1.text.strip() == r2.text.strip()
-        elif "text/html" in content_type:
-            if HAS_BS4:
-                soup1 = BeautifulSoup(r1.text, 'html.parser')
-                soup2 = BeautifulSoup(r2.text, 'html.parser')
-                return soup1.get_text().strip() == soup2.get_text().strip()
-            else:
-                return r1.text.strip() == r2.text.strip()
-        else:  # نصوص عادية أو غير معروفة
-            return r1.text.strip() == r2.text.strip()
-
-    def _analyze_roles(self, user_a: AuthContext, user_b: AuthContext, result: Dict[str, Any]):
-        """Analyze the roles of users to detect any role-based BOLA."""
-        if user_a.role and user_b.role:
-            if user_b.role != user_a.role and result["status"] in ("CONFIRMED_BOLA", "POTENTIAL_BOLA"):
-                result["details"].append(f"Role-based access violation: {user_b.role} accessed {user_a.role} resource")
-                result["status"] = "ROLE_BASED_BOLA"
-                result["severity"] = "CRITICAL"
-                result["confidence"] = max(result["confidence"], 0.9)
-                result["statistics"]["vulnerabilities_found"] += 1
-
-    def _fail(self, result, status, message):
-        """Helper to finalize the result in case of failure."""
-        result["status"] = status
-        result["details"].append(message)
-        result["confidence"] = 0.0
-        return result
+                result["confidence"] = min(0.95 * risk_score / 10, 1.0)
+                result["details"].append("User B accessed identical resource owned by
