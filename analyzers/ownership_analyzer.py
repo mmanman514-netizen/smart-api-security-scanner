@@ -99,6 +99,8 @@ class OwnershipAnalyzer:
         if resource.admin_only:
             resource.add_risk_flag("ADMIN_ONLY_RISK")
             metrics["risk_flags_added"] += 1
-        if resource.exposed_fields_count({}) > self.custom_risk_thresholds.get("exposed_fields", 0):  # Placeholder for data
+        # تحسين: استخدم بيانات حقيقية إذا متوفرة، أو افترض 0 للبيانات الفارغة
+        exposed_count = resource.exposed_fields_count({})  # يمكن تمرير بيانات حقيقية هنا
+        if exposed_count > self.custom_risk_thresholds.get("exposed_fields", 0):
             resource.add_risk_flag("HIGH_EXPOSURE")
             metrics["risk_flags_added"] += 1
