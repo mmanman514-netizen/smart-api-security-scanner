@@ -1,9 +1,15 @@
-from typing import List, Optional, Dict, Any, Callable, Set
+from typing import List, Optional, Dict, Any, Callable, Set, Enum
 import re
 import json
 from functools import lru_cache
 from urllib.parse import urlparse
 import weakref
+
+class ResourceType(Enum):
+    USER_OWNED = "user_owned"
+    SHARED = "shared"
+    PUBLIC = "public"
+    ADMIN_ONLY = "admin_only"
 
 class ApiResource:
     def __init__(
@@ -20,7 +26,8 @@ class ApiResource:
         default_jwt_algorithms: Optional[List[str]] = None,
         jwt_algorithm_validator: Optional[Callable[[str], bool]] = None,  # ديناميكي
         object_id_regex: Optional[str] = r'^[a-zA-Z0-9\-_.{}%@\+\=]+$',  # مرن لـ UUIDs وغيرها
-        risk_flags: Optional[Set[str]] = None,  # مجموعة من flags المخاطر (مثل "high_risk", "sensitive_data")
+        risk_flags: Optional[Set[str]] = None,  # مجموعة من flags المخاطر
+        resource_type: ResourceType = ResourceType.USER_OWNED,  # نوع المورد
     ):
         # Input validation (محسنة)
         if not name or not isinstance(name, str) or len(name.strip()) == 0:
@@ -37,6 +44,8 @@ class ApiResource:
             raise ValueError("Owner field must be a valid dot-separated path")
         if risk_flags and not all(isinstance(flag, str) for flag in risk_flags):
             raise ValueError("Risk flags must be a set of strings")
+        if not isinstance(resource_type, ResourceType):
+            raise ValueError("Resource type must be a ResourceType enum")
 
         self.name = name
         self.endpoint = endpoint
@@ -50,7 +59,8 @@ class ApiResource:
         self.default_jwt_algorithms = default_jwt_algorithms or ["RS256", "HS256"]
         self.jwt_algorithm_validator = jwt_algorithm_validator or (lambda alg: alg in self.default_jwt_algorithms)  # ديناميكي
         self.object_id_regex = object_id_regex
-        self.risk_flags: Set[str] = set(risk_flags) if risk_flags else set()  # الحقل الجديد
+        self.risk_flags: Set[str] = set(risk_flags) if risk_flags else set()
+        self.resource_type = resource_type
 
     def build_url(self, base_url: str, object_id: Any) -> str:
         """Construct full URL with base_url and object_id validation to prevent injection."""
@@ -102,7 +112,7 @@ class ApiResource:
     def exposed_fields_count(self, data: Dict[str, Any]) -> int:
         """Count sensitive fields present in the response with nested support."""
         if not data:
-            return 0
+            return 0  # إذا كانت البيانات فارغة، لا توجد حقول مكشوفة
         count = 0
         for f in self.sensitive_fields:
             if self._field_exists(data, f):
@@ -162,5 +172,5 @@ class ApiResource:
             f"sensitive_fields={self.sensitive_fields} "
             f"multi_tenant={self.multi_tenant} admin_only={self.admin_only} "
             f"criticality={self.criticality} jwt_validator={self.jwt_algorithm_validator.__name__ if callable(self.jwt_algorithm_validator) else 'default'} "
-            f"object_id_regex={self.object_id_regex} risk_flags={self.risk_flags}>"
-        )
+            f"object_id_regex={self.object_id_regex} risk_flags={self.risk_flags} resource_type={self.resource_type.value}>"
+            )
