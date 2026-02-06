@@ -1,30 +1,198 @@
 {
-  "target": "http://127.0.0.1:5000",
-
-  "auth": {
-    "user_a": {
-      "headers": {
-        "Authorization": "Bearer TOKEN_USER_A"
-      }
+  "$schema": "https://api.company.com/schemas/bola-config-v2.1.json",  // ✅ Schema validation reference
+  "version": "2.1",
+  "metadata": {
+    "name": "BOLA Security Audit",
+    "environment": "staging",
+    "created_by": "security-team",
+    "updated_at": "2023-10-01T12:00:00Z",
+    "expires": "2024-12-31",
+    "examples": {
+      "basic_usage": "Load this config with config_loader.py and run scan with --config path/to/config.json",
+      "advanced_usage": "Use with async loading for large scans: await load_config_async(path)"
+    }
+  },
+  "target": {
+    "base_url": "https://api.company.com",
+    "validate_ssl": true,
+    "certificate_pinning": {  // ✅ Certificate pinning for security
+      "enabled": true,
+      "thumbprint": "SHA256:ABC123...",
+      "issuer": "CN=Company CA"
     },
-    "user_b": {
-      "headers": {
-        "Authorization": "Bearer TOKEN_USER_B"
+    "ip_whitelist": ["192.168.1.0/24"],  // ✅ IP whitelisting
+    "default_headers": {
+      "Content-Type": "application/json",
+      "User-Agent": "BOLA-Scanner/2.1"
+    }
+  },
+  "authentication": {
+    "strategy": "env_variables",
+    "contexts": {
+      "user_a": {
+        "label": "Regular User Alice",
+        "type": "bearer_token",
+        "token_env_var": "USER_A_TOKEN",
+        "role": "customer",
+        "expected_scopes": ["user.read", "profile.read"]
+      },
+      "user_b": {
+        "label": "Regular User Bob", 
+        "type": "bearer_token",
+        "token_env_var": "USER_B_TOKEN",
+        "role": "customer",
+        "expected_scopes": ["user.read", "profile.read"]
+      },
+      "admin_user": {
+        "label": "Administrator",
+        "type": "api_key",
+        "key_env_var": "ADMIN_API_KEY",
+        "role": "admin",
+        "expected_scopes": ["*"]
       }
     }
   },
-
   "resources": [
     {
+      "id": "user_profile",
       "name": "User Profile",
-      "endpoint": "/api/user/{id}",
+      "endpoint": "/api/v1/users/{user_id}",
+      "methods": ["GET", "PUT", "PATCH", "DELETE"],
+      "owner_field": "user_id",
+      "resource_type": "USER_OWNED",
+      "validation_rules": {  // ✅ Custom validation rules
+        "owner_field_regex": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",  // UUID regex
+        "endpoint_pattern": "/api/v1/users/{user_id}"
+      },
+      "sensitivity": {
+        "level": "HIGH",
+        "fields": ["email", "phone_number", "date_of_birth", "address"],
+        "compliance_tags": ["PII", "GDPR"]
+      },
+      "authorization": {
+        "required_scope": "user.manage",
+        "allowed_roles": ["owner", "admin"],
+        "multi_tenant": true,
+        "tenant_field": "organization_id"
+      }
+    },
+    {
+      "id": "user_orders",
+      "name": "User Orders",
+      "endpoint": "/api/v1/users/{user_id}/orders/{order_id}",
+      "methods": ["GET", "POST", "DELETE"],
+      "owner_field": "user_id",
+      "resource_type": "USER_OWNED",
+      "authorization": {
+        "required_scope": "orders.manage",
+        "allowed_roles": ["owner", "admin", "support"]
+      }
+    },
+    {
+      "id": "admin_dashboard",
+      "name": "Admin Dashboard",
+      "endpoint": "/api/v1/admin/metrics",
       "methods": ["GET"],
-      "owner_field": "id"
+      "resource_type": "ADMIN_ONLY",
+      "authorization": {
+        "required_scope": "admin.access",
+        "allowed_roles": ["admin"],
+        "admin_only": true
+      }
     }
   ],
-
-  "scan": {
-    "type": "bola",
-    "object_ids": [1]
+  "scan_configuration": {
+    "strategy": "comprehensive_bola",
+    "phases": [
+      {
+        "name": "id_enumeration",
+        "technique": "range_testing",
+        "parallel_execution": true,  // ✅ Parallel processing
+        "id_patterns": [
+          {"type": "numeric", "range": [1, 1000], "step": 1},
+          {"type": "numeric", "range": [10000, 11000], "step": 100},
+          {"type": "uuid", "version": 4},
+          {"type": "regex", "pattern": "^user_[a-zA-Z0-9]{5,}$"}  // ✅ Custom regex pattern
+        ]
+      },
+      {
+        "name": "cross_user_testing",
+        "technique": "role_swapping",
+        "user_pairs": [["user_a", "user_b"], ["user_a", "admin_user"]],
+        "test_modifications": true
+      }
+    ],
+    "performance": {
+      "max_concurrent": 5,
+      "requests_per_second": 2.0,
+      "timeout_seconds": 30,
+      "retry_attempts": 2,
+      "backoff_factor": 1.5,
+      "caching": {  // ✅ Caching options
+        "enabled": true,
+        "ttl_seconds": 300,
+        "max_cache_size": 1000
+      }
+    },
+    "reporting": {
+      "level": "detailed",
+      "output_formats": ["json", "html", "markdown"],
+      "include_evidence": true,
+      "mask_sensitive_data": true,
+      "integration_hooks": {  // ✅ Integration hooks
+        "webhooks": {
+          "on_scan_complete": "https://slack.company.com/webhook/bola-alerts",
+          "on_vulnerability_found": "https://jira.company.com/api/issues"
+        },
+        "api_endpoints": {
+          "dashboard": "https://dashboard.company.com/api/bola-reports",
+          "export": "https://export.company.com/api/generate-report"
+        }
+      }
+    },
+    "metrics": {  // ✅ Metrics
+      "expected_scan_time_minutes": 30,
+      "resource_count": 3,
+      "estimated_requests": 1500,
+      "risk_assessment": "HIGH"
+    }
+  },
+  "safety_controls": {
+    "target_validation": {
+      "disallowed_domains": ["production.company.com", "localhost"],
+      "allowed_environments": ["staging", "development", "qa"],
+      "require_confirmation": true
+    },
+    "rate_limiting": {
+      "max_requests_total": 1000,
+      "auto_stop_on_error_rate": 0.1,
+      "circuit_breaker": {
+        "failure_threshold": 10,
+        "reset_timeout": 60
+      }
+    },
+    "data_handling": {
+      "mask_sensitive_in_logs": true,
+      "no_persistent_storage": false,
+      "encryption": {  // ✅ Encryption details
+        "required": true,
+        "algorithm": "AES-256-GCM",
+        "key_management": "AWS-KMS",
+        "key_id": "${ENCRYPTION_KEY_ID}"
+      }
+    }
+  },
+  "compliance": {
+    "ethical_use_agreement": {
+      "authorized_testing_only": true,
+      "requires_written_permission": true,
+      "responsible_disclosure": true,
+      "report_template": "SECURITY-REPORT-{DATE}.md"
+    },
+    "environment_requirements": {
+      "variables": ["USER_A_TOKEN", "USER_B_TOKEN", "ADMIN_API_KEY", "ENCRYPTION_KEY_ID"],
+      "validation": "preflight_check",
+      "fail_fast": true
+    }
   }
 }
