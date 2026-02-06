@@ -1,4 +1,4 @@
-from typing import List, Optional, Dict, Any, Callable
+from typing import List, Optional, Dict, Any, Callable, Set
 import re
 import json
 from functools import lru_cache
@@ -20,6 +20,7 @@ class ApiResource:
         default_jwt_algorithms: Optional[List[str]] = None,
         jwt_algorithm_validator: Optional[Callable[[str], bool]] = None,  # ديناميكي
         object_id_regex: Optional[str] = r'^[a-zA-Z0-9\-_.{}%@\+\=]+$',  # مرن لـ UUIDs وغيرها
+        risk_flags: Optional[Set[str]] = None,  # مجموعة من flags المخاطر (مثل "high_risk", "sensitive_data")
     ):
         # Input validation (محسنة)
         if not name or not isinstance(name, str) or len(name.strip()) == 0:
@@ -34,6 +35,8 @@ class ApiResource:
             raise ValueError("At least one valid HTTP method must be provided")
         if owner_field and not re.match(r'^[a-zA-Z0-9_.]+$', owner_field):  # تحقق من سلامة المسار
             raise ValueError("Owner field must be a valid dot-separated path")
+        if risk_flags and not all(isinstance(flag, str) for flag in risk_flags):
+            raise ValueError("Risk flags must be a set of strings")
 
         self.name = name
         self.endpoint = endpoint
@@ -47,6 +50,7 @@ class ApiResource:
         self.default_jwt_algorithms = default_jwt_algorithms or ["RS256", "HS256"]
         self.jwt_algorithm_validator = jwt_algorithm_validator or (lambda alg: alg in self.default_jwt_algorithms)  # ديناميكي
         self.object_id_regex = object_id_regex
+        self.risk_flags: Set[str] = set(risk_flags) if risk_flags else set()  # الحقل الجديد
 
     def build_url(self, base_url: str, object_id: Any) -> str:
         """Construct full URL with base_url and object_id validation to prevent injection."""
@@ -137,6 +141,20 @@ class ApiResource:
         """Validate JWT algorithm dynamically."""
         return self.jwt_algorithm_validator(algorithm)
 
+    def add_risk_flag(self, flag: str):
+        """Add a risk flag to the set."""
+        if not isinstance(flag, str):
+            raise ValueError("Risk flag must be a string")
+        self.risk_flags.add(flag)
+
+    def remove_risk_flag(self, flag: str):
+        """Remove a risk flag from the set."""
+        self.risk_flags.discard(flag)
+
+    def has_risk_flag(self, flag: str) -> bool:
+        """Check if a specific risk flag is present."""
+        return flag in self.risk_flags
+
     def __repr__(self):
         return (
             f"<ApiResource name={self.name} endpoint={self.endpoint} "
@@ -144,5 +162,5 @@ class ApiResource:
             f"sensitive_fields={self.sensitive_fields} "
             f"multi_tenant={self.multi_tenant} admin_only={self.admin_only} "
             f"criticality={self.criticality} jwt_validator={self.jwt_algorithm_validator.__name__ if callable(self.jwt_algorithm_validator) else 'default'} "
-            f"object_id_regex={self.object_id_regex}>"
-                               )
+            f"object_id_regex={self.object_id_regex} risk_flags={self.risk_flags}>"
+        )
