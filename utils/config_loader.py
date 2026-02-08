@@ -1,384 +1,287 @@
-import asyncio
+"""
+محمل تكوين API Security Scanner مع دعم كامل لـ v2.1
+"""
+
 import json
-import logging
+import yaml
 import os
-import time
+import re
+import sys
 from typing import Dict, Any, List, Optional
-from urllib.parse import urlparse
+from pathlib import Path
+import uuid
+import random
+import string
 
-try:
-    import aiofiles
-    HAS_AIOFILES = True
-except ImportError:
-    HAS_AIOFILES = False
-    aiofiles = None
-
-try:
-    import yaml
-    HAS_YAML = True
-except ImportError:
-    HAS_YAML = False
-    yaml = None
-
-try:
-    import tomli
-    HAS_TOML = True
-except ImportError:
-    HAS_TOML = False
-    tomli = None
-
-try:
-    import jsonschema
-    HAS_JSONSCHEMA = True
-except ImportError:
-    HAS_JSONSCHEMA = False
-    jsonschema = None
-
-from models.api_resource import ApiResource, ResourceType
-from models.auth_context import AuthContext
-
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-class ConfigError(Exception):
-    """Custom exception for configuration errors."""
-    pass
-
-# Basic JSON Schema for validation
-DEFAULT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "target": {"type": "string"},
-        "auth": {"type": "object"},
-        "resources": {"type": "array"},
-        "scan": {"type": "object"}
-    },
-    "required": ["target", "auth", "resources"]
-}
-
-# Cache for loaded configs
-_config_cache: Dict[str, Dict[str, Any]] = {}
-_cache_timestamps: Dict[str, float] = {}
-CACHE_TTL = 300  # 5 minutes
-
-def _require(data: Dict[str, Any], key: str):
-    if key not in data:
-        raise ConfigError(f"Missing required config key: '{key}'")
-    return data[key]
-
-def _validate_url(url: str) -> bool:
-    """Validate URL format."""
-    parsed = urlparse(url)
-    return bool(parsed.scheme and parsed.netloc)
-
-def _sanitize_path(path: str) -> str:
-    """Sanitize path to prevent traversal."""
-    abs_path = os.path.abspath(path)
-    if ".." in abs_path or not abs_path.startswith(os.getcwd()):
-        raise ConfigError(f"Invalid path: {path} (path traversal detected)")
-    return abs_path
-
-def _mask_sensitive(value: Any) -> Any:
-    """Mask sensitive values for logging."""
-    if isinstance(value, str) and len(value) > 4:
-        return value[:2] + "*" * (len(value) - 4) + value[-2:]
-    return value
-
-def _expand_env_vars(data: Any) -> Any:
-    """Recursively expand environment variables in strings, with validation."""
-    if isinstance(data, str):
-        expanded = os.path.expandvars(data)
-        if "$" in data and expanded == data:
-            raise ConfigError(f"Environment variable not found in: {data}")
-        return expanded
-    elif isinstance(data, dict):
-        return {k: _expand_env_vars(v) for k, v in data.items()}
-    elif isinstance(data, list):
-        return [_expand_env_vars(item) for item in data]
-    return data
-
-def _cleanup_cache():
-    """Remove expired cache entries."""
-    now = time.time()
-    expired = [k for k, t in _cache_timestamps.items() if now - t > CACHE_TTL]
-    for k in expired:
-        del _config_cache[k]
-        del _cache_timestamps[k]
-
-def load_config(path: str, validate_schema: bool = True, custom_schema: Optional[Dict[str, Any]] = None, use_cache: bool = True) -> Dict[str, Any]:
-    """
-    Load scanner configuration from JSON, YAML, or TOML file with advanced validation.
+class ConfigLoader:
+    """محمل التكوين المحسن مع دعم v2.1"""
     
-    Supports environment variable interpolation (e.g., ${VAR_NAME}), caching, and metrics.
-    Validates types, URLs, and optional JSON Schema.
-    
-    Security Notes:
-    - Always use with permission; unauthorized access violates laws.
-    - Environment variables are expanded and validated for secrets.
-    - Schema validation and path sanitization prevent malformed configs.
-    - Sensitive values are masked in logs.
-    
-    :param path: Path to config file (JSON, YAML, or TOML).
-    :param validate_schema: Enable JSON Schema validation.
-    :param custom_schema: Custom JSON Schema for validation.
-    :param use_cache: Enable caching for loaded configs.
-    :return: dict with keys: target, auth_contexts, resources, scan, metrics.
-    """
-    sanitized_path = _sanitize_path(path)
-    
-    # Check cache
-    if use_cache and sanitized_path in _config_cache and time.time() - _cache_timestamps.get(sanitized_path, 0) < CACHE_TTL:
-        logger.info(f"Config loaded from cache: {sanitized_path}")
-        return _config_cache[sanitized_path]
-    
-    start_time = time.time()
-    try:
-        with open(sanitized_path, "r", encoding="utf-8") as f:
-            file_size = os.path.getsize(sanitized_path)
-            if sanitized_path.endswith(('.yaml', '.yml')):
-                if not HAS_YAML:
-                    raise ConfigError("YAML support not available; install PyYAML")
-                data = yaml.safe_load(f)
-            elif sanitized_path.endswith('.toml'):
-                if not HAS_TOML:
-                    raise ConfigError("TOML support not available; install tomli")
-                data = tomli.load(f)
-            else:
-                data = json.load(f)
-    except Exception as e:
-        raise ConfigError(f"Failed to load config file: {e}")
-
-    # Expand environment variables
-    data = _expand_env_vars(data)
-
-    # Schema validation
-    if validate_schema and HAS_JSONSCHEMA:
-        schema = custom_schema or DEFAULT_SCHEMA
-        try:
-            jsonschema.validate(data, schema)
-        except jsonschema.ValidationError as e:
-            raise ConfigError(f"Config schema validation failed: {e}")
-
-    # ---------- Root validation ----------
-    target = _require(data, "target")
-    if not _validate_url(target):
-        raise ConfigError(f"Invalid target URL: {target}")
-    
-    auth_cfg = _require(data, "auth")
-    resources_cfg = _require(data, "resources")
-    scan_cfg = data.get("scan", {})
-
-    # ---------- Auth contexts (multiple support) ----------
-    auth_contexts: Dict[str, AuthContext] = {}
-    for label, cfg in auth_cfg.items():
-        if not isinstance(cfg, dict):
-            raise ConfigError(f"Auth config for '{label}' must be a dict")
-        try:
-            masked_cfg = {k: _mask_sensitive(v) for k, v in cfg.items()}
-            logger.debug(f"Loading auth context '{label}': {masked_cfg}")
-            auth_contexts[label] = AuthContext(
-                headers=cfg.get("headers"),
-                cookies=cfg.get("cookies"),
-                label=label,
-            )
-        except Exception as e:
-            raise ConfigError(f"Invalid auth config for '{label}': {e}")
-
-    # ---------- Resources ----------
-    resources: List[ApiResource] = []
-    for idx, r in enumerate(resources_cfg):
-        if not isinstance(r, dict):
-            raise ConfigError(f"Resource at index {idx} must be a dict")
-        try:
-            methods = _require(r, "methods")
-            if not isinstance(methods, list) or not all(isinstance(m, str) for m in methods):
-                raise ConfigError(f"Methods must be a list of strings at index {idx}")
+    @staticmethod
+    def load(file_path: str, validate: bool = True) -> Dict[str, Any]:
+        """
+        تحميل ملف التكوين بدعم الإصدارات المختلفة
+        
+        Args:
+            file_path: مسار ملف التكوين
+            validate: إذا كان True، يتحقق من صحة التكوين
             
-            resource = ApiResource(
-                name=_require(r, "name"),
-                endpoint=_require(r, "endpoint"),
-                methods=methods,
-                owner_field=r.get("owner_field"),
-                sensitive_fields=r.get("sensitive_fields", []),
-                writable_fields=r.get("writable_fields", []),
-                multi_tenant=r.get("multi_tenant", True),
-                admin_only=r.get("admin_only", False),
-                criticality=r.get("criticality", "low"),
-                resource_type=ResourceType(r.get("resource_type", ResourceType.USER_OWNED.value)),
-            )
-            resources.append(resource)
-        except Exception as e:
-            raise ConfigError(f"Invalid resource definition at index {idx}: {e}")
-
-    load_time = time.time() - start_time
-    metrics = {
-        "load_time_seconds": load_time,
-        "file_size_bytes": file_size,
-        "auth_contexts_count": len(auth_contexts),
-        "resources_count": len(resources),
-    }
+        Returns:
+            التكوين المحمل والمحوّل
+        """
+        path = Path(file_path)
+        
+        if not path.exists():
+            raise FileNotFoundError(f"Config file not found: {file_path}")
+        
+        # قراءة الملف بناءً على نوعه
+        if path.suffix.lower() in ['.json', '.json5']:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+        elif path.suffix.lower() in ['.yaml', '.yml']:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f)
+        else:
+            # محاولة التخمين
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+            except:
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        config = yaml.safe_load(f)
+                except:
+                    raise ValueError(f"Unsupported config format: {file_path}")
+        
+        # التحقق من الإصدار
+        version = config.get("version", "1.0")
+        
+        if version.startswith("2."):
+            print(f"📦 Loading v{version} configuration...")
+            config = ConfigLoader._convert_v2_to_v1(config)
+        
+        if validate:
+            ConfigLoader._validate_config(config)
+        
+        return config
     
-    result = {
-        "target": target,
-        "auth_contexts": auth_contexts,
-        "resources": resources,
-        "scan": scan_cfg,
-        "metrics": metrics,
-    }
-    
-    # Cache result
-    if use_cache:
-        _config_cache[sanitized_path] = result
-        _cache_timestamps[sanitized_path] = time.time()
-        _cleanup_cache()
-    
-    logger.info(f"Config loaded successfully: {len(auth_contexts)} auth contexts, {len(resources)} resources in {load_time:.2f}s")
-    return result
-
-async def load_config_async(path: str, validate_schema: bool = True, custom_schema: Optional[Dict[str, Any]] = None, use_cache: bool = True) -> Dict[str, Any]:
-    """Async version with true async I/O."""
-    if not HAS_AIOFILES:
-        raise ConfigError("Async loading requires aiofiles; install aiofiles")
-    
-    sanitized_path = _sanitize_path(path)
-    
-    # Check cache
-    if use_cache and sanitized_path in _config_cache and time.time() - _cache_timestamps.get(sanitized_path, 0) < CACHE_TTL:
-        logger.info(f"Config loaded from cache (async): {sanitized_path}")
-        return _config_cache[sanitized_path]
-    
-    start_time = time.time()
-    try:
-        async with aiofiles.open(sanitized_path, "r", encoding="utf-8") as f:
-            content = await f.read()
-            file_size = len(content.encode('utf-8'))
-            if sanitized_path.endswith(('.yaml', '.yml')):
-                if not HAS_YAML:
-                    raise ConfigError("YAML support not available; install PyYAML")
-                data = yaml.safe_load(content)
-            elif sanitized_path.endswith('.toml'):
-                if not HAS_TOML:
-                    raise ConfigError("TOML support not available; install tomli")
-                data = tomli.loads(content)
-            else:
-                data = json.loads(content)
-    except Exception as e:
-        raise ConfigError(f"Failed to load config file (async): {e}")
-
-    # Expand environment variables
-    data = _expand_env_vars(data)
-
-    # Schema validation (run in executor if needed)
-    if validate_schema and HAS_JSONSCHEMA:
-        schema = custom_schema or DEFAULT_SCHEMA
-        try:
-            jsonschema.validate(data, schema)
-        except jsonschema.ValidationError as e:
-            raise ConfigError(f"Config schema validation failed: {e}")
-
-    # ---------- Root validation ----------
-    target = _require(data, "target")
-    if not _validate_url(target):
-        raise ConfigError(f"Invalid target URL: {target}")
-    
-    auth_cfg = _require(data, "auth")
-    resources_cfg = _require(data, "resources")
-    scan_cfg = data.get("scan", {})
-
-    # ---------- Auth contexts (multiple support) ----------
-    auth_contexts: Dict[str, AuthContext] = {}
-    for label, cfg in auth_cfg.items():
-        if not isinstance(cfg, dict):
-            raise ConfigError(f"Auth config for '{label}' must be a dict")
-        try:
-            masked_cfg = {k: _mask_sensitive(v) for k, v in cfg.items()}
-            logger.debug(f"Loading auth context '{label}' (async): {masked_cfg}")
-            auth_contexts[label] = AuthContext(
-                headers=cfg.get("headers"),
-                cookies=cfg.get("cookies"),
-                label=label,
-            )
-        except Exception as e:
-            raise ConfigError(f"Invalid auth config for '{label}': {e}")
-
-    # ---------- Resources ----------
-    resources: List[ApiResource] = []
-    for idx, r in enumerate(resources_cfg):
-        if not isinstance(r, dict):
-            raise ConfigError(f"Resource at index {idx} must be a dict")
-        try:
-            methods = _require(r, "methods")
-            if not isinstance(methods, list) or not all(isinstance(m, str) for m in methods):
-                raise ConfigError(f"Methods must be a list of strings at index {idx}")
-            
-            resource = ApiResource(
-                name=_require(r, "name"),
-                endpoint=_require(r, "endpoint"),
-                methods=methods,
-                owner_field=r.get("owner_field"),
-                sensitive_fields=r.get("sensitive_fields", []),
-                writable_fields=r.get("writable_fields", []),
-                multi_tenant=r.get("multi_tenant", True),
-                admin_only=r.get("admin_only", False),
-                criticality=r.get("criticality", "low"),
-                resource_type=ResourceType(r.get("resource_type", ResourceType.USER_OWNED.value)),
-            )
-            resources.append(resource)
-        except Exception as e:
-            raise ConfigError(f"Invalid resource definition at index {idx}: {e}")
-
-    load_time = time.time() - start_time
-    metrics = {
-        "load_time_seconds": load_time,
-        "file_size_bytes": file_size,
-        "auth_contexts_count": len(auth_contexts),
-        "resources_count": len(resources),
-    }
-    
-    result = {
-        "target": target,
-        "auth_contexts": auth_contexts,
-        "resources": resources,
-        "scan": scan_cfg,
-        "metrics": metrics,
-    }
-    
-    # Cache result
-    if use_cache:
-        _config_cache[sanitized_path] = result
-        _cache_timestamps[sanitized_path] = time.time()
-        _cleanup_cache()
-    
-    logger.info(f"Config loaded successfully (async): {len(auth_contexts)} auth contexts, {len(resources)} resources in {load_time:.2f}s")
-    return result
-
-# ---------- Simple Unit Tests (using pytest) ----------
-if __name__ == "__main__":
-    import tempfile
-    import pytest
-
-    def test_load_config():
-        config_data = {
-            "target": "https://example.com",
-            "auth": {"user_a": {"headers": {"Authorization": "Bearer token"}}},
-            "resources": [{"name": "Test", "endpoint": "/test/{id}", "methods": ["GET"]}],
-            "scan": {}
+    @staticmethod
+    def _convert_v2_to_v1(config_v2: Dict[str, Any]) -> Dict[str, Any]:
+        """تحويل تكوين v2.1 إلى صيغة متوافقة مع النظام"""
+        
+        # التكوين الأساسي v1
+        config_v1 = {
+            "api": {
+                "base_url": config_v2.get("target", {}).get("base_url", ""),
+                "validate_ssl": config_v2.get("target", {}).get("validate_ssl", True),
+                "default_headers": config_v2.get("target", {}).get("default_headers", {})
+            },
+            "auth": {
+                "strategy": config_v2.get("authentication", {}).get("strategy", "env_variables")
+            },
+            "scanners": {
+                "bola": {
+                    "rate_limit": config_v2.get("scan_configuration", {})
+                                   .get("performance", {})
+                                   .get("requests_per_second", 2.0),
+                    "max_concurrent": config_v2.get("scan_configuration", {})
+                                      .get("performance", {})
+                                      .get("max_concurrent", 5),
+                    "timeout": config_v2.get("scan_configuration", {})
+                                   .get("performance", {})
+                                   .get("timeout_seconds", 30),
+                    "strict_owner": True,
+                    "id_patterns": ConfigLoader._extract_id_patterns(config_v2),
+                    "user_pairs": ConfigLoader._extract_user_pairs(config_v2)
+                },
+                "rate_limit": {
+                    "max_concurrent": 10,
+                    "threshold_requests": 100,
+                    "time_window": 60
+                },
+                "injection": {
+                    "payloads_file": "payloads/sqli.txt",
+                    "max_concurrent": 3
+                }
+            },
+            "logging": {
+                "level": "INFO",
+                "file": "scanner.log",
+                "console": True
+            },
+            "report": {
+                "default_format": "json",
+                "output_dir": "reports",
+                "include_evidence": config_v2.get("scan_configuration", {})
+                                     .get("reporting", {})
+                                     .get("include_evidence", True),
+                "mask_sensitive_data": config_v2.get("scan_configuration", {})
+                                         .get("reporting", {})
+                                         .get("mask_sensitive_data", True)
+            },
+            "safety": {
+                "max_requests_total": config_v2.get("safety_controls", {})
+                                       .get("rate_limiting", {})
+                                       .get("max_requests_total", 1000),
+                "auto_stop_on_error_rate": config_v2.get("safety_controls", {})
+                                             .get("rate_limiting", {})
+                                             .get("auto_stop_on_error_rate", 0.1),
+                "disallowed_domains": config_v2.get("safety_controls", {})
+                                        .get("target_validation", {})
+                                        .get("disallowed_domains", []),
+                "allowed_environments": config_v2.get("safety_controls", {})
+                                          .get("target_validation", {})
+                                          .get("allowed_environments", [])
+            }
         }
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump(config_data, f)
-            f.flush()
-            result = load_config(f.name)
-            assert result["target"] == "https://example.com"
-            assert "user_a" in result["auth_contexts"]
-            assert len(result["resources"]) == 1
-            os.unlink(f.name)
-
-    def test_invalid_url():
-        with pytest.raises(ConfigError):
-            load_config("invalid_path.json")
-
-    # Run tests
-    test_load_config()
-    test_invalid_url()
-    print("All tests passed!")
+        
+        return config_v1
+    
+    @staticmethod
+    def _extract_id_patterns(config_v2: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """استخراج أنماط ID من تكوين v2.1"""
+        patterns = []
+        
+        phases = config_v2.get("scan_configuration", {}).get("phases", [])
+        for phase in phases:
+            if phase.get("name") == "id_enumeration":
+                id_patterns = phase.get("id_patterns", [])
+                for pattern in id_patterns:
+                    patterns.append({
+                        "type": pattern.get("type", "numeric"),
+                        "range": pattern.get("range", [1, 100]),
+                        "step": pattern.get("step", 1),
+                        "pattern": pattern.get("pattern", "")
+                    })
+                break
+        
+        return patterns or [
+            {"type": "numeric", "range": [1, 100], "step": 1},
+            {"type": "uuid", "version": 4}
+        ]
+    
+    @staticmethod
+    def _extract_user_pairs(config_v2: Dict[str, Any]) -> List[List[str]]:
+        """استخراج أزواج المستخدمين من تكوين v2.1"""
+        user_pairs = []
+        
+        phases = config_v2.get("scan_configuration", {}).get("phases", [])
+        for phase in phases:
+            if phase.get("name") == "cross_user_testing":
+                user_pairs = phase.get("user_pairs", [])
+                break
+        
+        # إذا لم توجد أزواج، نستخدم الافتراضي
+        if not user_pairs and "authentication" in config_v2:
+            contexts = list(config_v2["authentication"].get("contexts", {}).keys())
+            if len(contexts) >= 2:
+                user_pairs = [[contexts[0], contexts[1]]]
+        
+        return user_pairs
+    
+    @staticmethod
+    def _validate_config(config: Dict[str, Any]):
+        """التحقق من صحة التكوين"""
+        errors = []
+        
+        # التحقق من API base_url
+        if not config.get("api", {}).get("base_url"):
+            errors.append("Missing required field: api.base_url")
+        
+        # التحقق من وجود ماسحات
+        if not config.get("scanners"):
+            errors.append("Missing required section: scanners")
+        
+        if errors:
+            raise ValueError(f"Config validation failed: {'; '.join(errors)}")
+        
+        print("✅ Configuration validated successfully")
+    
+    @staticmethod
+    def load_resources(file_path: str) -> List[Dict[str, Any]]:
+        """تحميل الموارد من ملف التكوين v2.1"""
+        config = ConfigLoader.load(file_path, validate=False)
+        
+        resources = config.get("resources", [])
+        converted_resources = []
+        
+        for resource in resources:
+            # تخطي الموارد التي ليست USER_OWNED (لـ BOLA)
+            if resource.get("resource_type") != "USER_OWNED":
+                continue
+            
+            converted = {
+                "name": resource.get("name", ""),
+                "endpoint": resource.get("endpoint", "").replace("{user_id}", "{id}"),
+                "methods": resource.get("methods", []),
+                "owner_field": resource.get("owner_field")
+            }
+            
+            # إضافة الحقول الحساسة
+            if "sensitivity" in resource:
+                converted["sensitive_fields"] = resource["sensitivity"].get("fields", [])
+            
+            # إضافة قواعد التحقق
+            if "validation_rules" in resource:
+                converted["validation_rules"] = resource["validation_rules"]
+            
+            converted_resources.append(converted)
+        
+        return converted_resources
+    
+    @staticmethod
+    def load_auth_contexts(file_path: str) -> Dict[str, Dict[str, Any]]:
+        """تحميل سياقات المصادقة من ملف التكوين v2.1"""
+        config = ConfigLoader.load(file_path, validate=False)
+        
+        auth_contexts_v2 = config.get("authentication", {}).get("contexts", {})
+        auth_contexts_v1 = {}
+        
+        for user_id, user_config in auth_contexts_v2.items():
+            # استخراج التوكن من المتغير البيئي
+            token_env_var = user_config.get("token_env_var") or user_config.get("key_env_var")
+            token = os.getenv(token_env_var, "") if token_env_var else ""
+            
+            # إذا كان التوكن فارغاً، نستخدم قيمة وهمية للاختبار
+            if not token and "test" in config.get("metadata", {}).get("environment", "").lower():
+                token = f"test_token_{user_id}"
+                print(f"⚠️  Using test token for {user_id}")
+            
+            auth_contexts_v1[user_id] = {
+                "token": token,
+                "token_type": "Bearer" if user_config.get("type") == "bearer_token" else "APIKey",
+                "headers": {
+                    "Authorization": f"Bearer {token}" if user_config.get("type") == "bearer_token"
+                                    else f"ApiKey {token}"
+                },
+                "role": user_config.get("role", "user"),
+                "expected_scopes": user_config.get("expected_scopes", [])
+            }
+        
+        return auth_contexts_v1
+    
+    @staticmethod
+    def generate_id_from_pattern(pattern: Dict[str, Any]) -> str:
+        """توليد ID بناءً على النمط"""
+        pattern_type = pattern.get("type", "numeric")
+        
+        if pattern_type == "numeric":
+            start, end = pattern.get("range", [1, 100])
+            step = pattern.get("step", 1)
+            return str(random.randrange(start, end, step))
+        
+        elif pattern_type == "uuid":
+            version = pattern.get("version", 4)
+            if version == 4:
+                return str(uuid.uuid4())
+            elif version == 1:
+                return str(uuid.uuid1())
+        
+        elif pattern_type == "regex":
+            regex_pattern = pattern.get("pattern", "^[a-zA-Z0-9]{8}$")
+            # توليد سلسلة عشوائية تطابق النمط (تبسيط)
+            length = 8
+            if match := re.search(r'\{(\d+),?(\d*)\}', regex_pattern):
+                length = int(match.group(1))
+            return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
+        
+        return str(random.randint(1, 1000))
