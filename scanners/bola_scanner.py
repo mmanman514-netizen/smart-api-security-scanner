@@ -1,324 +1,232 @@
+# scanners/bola_scanner.py - الإصدار المصحح
 import asyncio
 import aiohttp
-import requests
-import jwt
 import json
 import logging
 import time
-import xml.etree.ElementTree as ET
-import csv
-import io
-import re
-from typing import Dict, Any, Optional, List, Set, TypedDict, Literal
-from aiohttp import ClientError
-from functools import lru_cache
-from cryptography.fernet import Fernet
+import hashlib
+from typing import Dict, Any, Optional, List
+from models.api_resource import ApiResource
+from models.auth_context import AuthContext
 
-try:
-    import nest_asyncio
-    nest_asyncio.apply()
-except ImportError:
-    pass
+logger = logging.getLogger(__name__)
 
-# ... (imports الأخرى كما في النسخة السابقة)
-
-class ScanResult(TypedDict):
-    resource: str
-    object_id: str
-    method: str
-    status: str
-    severity: str
-    confidence: float
-    risk_score: float
-    authorization_verdict: Literal["ALLOW", "DENY", "INCONCLUSIVE"]
-    details: List[str]
-    evidence: Dict[str, Any]
-    statistics: Dict[str, Any]
-
-class BaseScanner:
+class BOLAScanner:
+    """BOLA (Broken Object Level Authorization) Scanner"""
+    
     def __init__(
         self,
-        base_url: str,
-        timeout: int = 10,
-        proxies: Optional[Dict[str, str]] = None,
-        max_retries: int = 3,
+        base_url: str = "",
         rate_limit: float = 1.0,
-        ignored_fields: Set[str] = {"created_at", "updated_at", "timestamp"},
-        risk_factors: Optional[Dict[str, float]] = None,
-        nested_ownership_paths: List[str] = ["owner_id", "user_id", "account_id", "creator_id", "author_id", "user.id", "owner.id", "account.owner_id"],
-        encryption_key: str,
-        jwt_public_key: Optional[str] = None,
-        jwt_algorithms: List[str] = ["RS256", "HS256"],  # configurable
-        revoked_tokens_cache: Optional[Set[str]] = None,  # للـ revoked tokens
+        max_concurrent: int = 5,
+        timeout: int = 30,
+        strict_owner: bool = False
     ):
-        self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
-        self.proxies = proxies
-        self.max_retries = max_retries
+        self.base_url = base_url
         self.rate_limit = rate_limit
-        self.last_request_time = 0.0
-        self.ignored_fields = ignored_fields
-        self.risk_factors = risk_factors or {
-            "method_delete": 1.5,
-            "status_diff": 1.2,
-            "role_diff": 1.3,
-            "data_type_plain": 1.1,
-        }
-        self.nested_ownership_paths = nested_ownership_paths
-        self.encryption_key = encryption_key
-        self.fernet = Fernet(encryption_key.encode())
-        self.jwt_public_key = jwt_public_key
-        self.jwt_algorithms = jwt_algorithms
-        self.revoked_tokens_cache = revoked_tokens_cache or set()
-
-    def _extract_jwt_info(self, auth: AuthContext, resource_algorithms: Optional[List[str]] = None) -> Dict[str, Any]:
-        """Extract and verify JWT with configurable algorithms and revoked check."""
-        token = auth.jwt_token
-        if not token or token in self.revoked_tokens_cache:
-            return {}
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.timeout = timeout
+        self.strict_owner = strict_owner
+        self.session = None
         
-        algorithms = resource_algorithms or self.jwt_algorithms
-        try:
-            if self.jwt_public_key:
-                payload = jwt.decode(token, self.jwt_public_key, algorithms=algorithms, options={"verify_exp": True})
-            else:
-                payload = jwt.decode(token, options={"verify_signature": False, "verify_exp": False})
-            return {
-                "subject": payload.get("sub"),
-                "roles": payload.get("roles", []),
-                "exp": payload.get("exp"),
-            }
-        except jwt.ExpiredSignatureError:
-            logger.warning("JWT expired")
-        except jwt.InvalidTokenError:
-            logger.warning("Invalid JWT")
-        except Exception as e:
-            logger.warning(f"JWT extraction failed: {e}")
-        return {}
-
-    def _get_data_size(self, response) -> int:
-        """Get data size using Content-Length to avoid memory consumption."""
-        content_length = response.headers.get("Content-Length")
-        if content_length:
-            try:
-                return int(content_length)
-            except ValueError:
-                pass
-        # Fallback: chunked reading without full load
-        size = 0
-        try:
-            async for chunk in response.content.iter_chunked(8192):  # 8KB chunks
-                size += len(chunk)
-                if size > 10**6:  # Cap at 1MB to avoid excessive reading
-                    break
-        except Exception:
-            pass
-        return size
-
-    def _categorize_error(self, exception: Optional[Exception] = None, status_code: Optional[int] = None) -> str:
-        """Categorize errors for detailed logging."""
-        if isinstance(exception, aiohttp.ClientConnectorError):
-            return "network_error"
-        if status_code:
-            if 400 <= status_code < 500:
-                return "client_error"
-            if 500 <= status_code < 600:
-                return "server_error"
-        return "unknown_error"
-
-    def _normalize_id(self, value: Any) -> str:
-        """Normalize IDs for ownership check (e.g., lower case emails, strip spaces)."""
-        if isinstance(value, str):
-            return value.lower().strip()
-        return str(value).strip()
-
-    def _evaluate_ownership(self, data: Dict[str, Any], user_id: Optional[str], jwt_subject: Optional[str], jwt_roles: Optional[List[str]]) -> bool:
-        """Evaluate ownership with normalization."""
-        for path in self.nested_ownership_paths:
-            value = self._get_nested_value(data, path)
-            if value and self._normalize_id(value) == self._normalize_id(user_id):
-                return True
-        if jwt_subject and self._normalize_id(jwt_subject) == self._normalize_id(user_id):
-            return True
-        if jwt_roles and "admin" in jwt_roles:
-            return True
-        return False
-
-    def _calculate_risk_score(
-        self, method: str, status_a: int, status_b: int, role_a: Optional[str], role_b: Optional[str], 
-        content_type: str, data_size: int = 0, criticality: str = "low", impact: str = "low", 
-        exploitability: str = "medium", exposed_fields: int = 0, endpoint_sensitivity: str = "public"
-    ) -> float:
-        """Enhanced OWASP-compliant risk score."""
-        base_score = 1.0
-        # Data size
-        if data_size > 1000:
-            base_score *= 1.5
-        # Exposed fields
-        if exposed_fields > 10:
-            base_score *= 1.2
-        # Endpoint sensitivity
-        if endpoint_sensitivity == "admin":
-            base_score *= 2.0
-        # Type of data (impact)
-        if "pii" in impact.lower():
-            base_score *= 2.0
-        if "financial" in impact.lower():
-            base_score *= 2.5
-        if "api_keys" in impact.lower():
-            base_score *= 3.0
-        # Exploitability
-        if exploitability == "high":
-            base_score *= 1.5
-        # Auth strength
-        if not role_a or not role_b:
-            base_score *= 1.3
-        # Method and status
-        if method.upper() == "DELETE":
-            base_score *= 1.5
-        if status_a != status_b:
-            base_score *= 1.2
-        return min(base_score, 10.0)
-
-    # ... (باقي الطرق كما في النسخة السابقة، مع التحسينات)
-
-class BOLAScanner(BaseScanner):
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.timeout))
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+    
     async def scan(
         self,
+        resources: List[ApiResource],
+        auth_contexts: Dict[str, AuthContext],
+        dry_run: bool = False
+    ) -> List[Dict[str, Any]]:
+        """
+        Scan for BOLA vulnerabilities
+        
+        Args:
+            resources: List of ApiResource to scan
+            auth_contexts: Dict with 'user_a' and 'user_b' AuthContext
+            dry_run: If True, don't make actual requests
+            
+        Returns:
+            List of findings
+        """
+        findings = []
+        
+        if not auth_contexts or len(auth_contexts) < 2:
+            raise ValueError("BOLA scan requires at least 2 auth contexts")
+        
+        user_a = auth_contexts.get("user_a")
+        user_b = auth_contexts.get("user_b")
+        
+        if not user_a or not user_b:
+            raise ValueError("Missing user_a or user_b in auth_contexts")
+        
+        for resource in resources:
+            # Skip non-user-owned resources
+            if not self._is_user_owned(resource):
+                continue
+            
+            # Get object IDs to test
+            object_ids = await self._get_object_ids(resource, user_a)
+            
+            for object_id in object_ids[:5]:  # Limit to 5 IDs
+                for method in resource.methods:
+                    if method in ["POST", "PUT", "DELETE"]:
+                        continue  # Skip destructive methods in basic scan
+                    
+                    if dry_run:
+                        logger.info(f"Dry run: {method} {resource.endpoint} id={object_id}")
+                        continue
+                    
+                    try:
+                        # Make requests
+                        response_a = await self._make_request(
+                            resource, user_a, object_id, method
+                        )
+                        response_b = await self._make_request(
+                            resource, user_b, object_id, method
+                        )
+                        
+                        # Compare responses
+                        if self._is_vulnerable(response_a, response_b, resource):
+                            finding = self._create_finding(
+                                resource, object_id, method, response_a, response_b
+                            )
+                            findings.append(finding)
+                            
+                    except Exception as e:
+                        logger.warning(f"Error scanning {resource.name}: {e}")
+        
+        return findings
+    
+    def _is_user_owned(self, resource: ApiResource) -> bool:
+        """Check if resource is user-owned"""
+        return "{id}" in resource.endpoint and resource.owner_field
+    
+    async def _get_object_ids(self, resource: ApiResource, auth_context: AuthContext) -> List[str]:
+        """Get object IDs to test"""
+        ids = set()
+        
+        # Try to get IDs from list endpoint
+        list_endpoint = resource.endpoint.replace("{id}", "")
+        try:
+            response = await self._make_request(resource, auth_context, "", "GET")
+            if response["status"] == 200:
+                ids.update(self._extract_ids_from_response(response["body"]))
+        except:
+            pass
+        
+        # Add some default IDs
+        ids.update(["1", "2", "100", "999"])
+        
+        return list(ids)
+    
+    async def _make_request(
+        self,
         resource: ApiResource,
-        user_a: AuthContext,
-        user_b: AuthContext,
-        object_id: str | int,
-        method: str = "GET",
-        request_body: Optional[Dict[str, Any]] = None,
-        custom_headers: Optional[Dict[str, str]] = None,
-        custom_risk_factors: Optional[Dict[str, float]] = None,
-        custom_ignored_fields: Optional[Set[str]] = None,
-        custom_nested_paths: Optional[List[str]] = None,
-        criticality: str = "low",
-        impact: str = "low",
-        exploitability: str = "medium",
-        jwt_algorithms: Optional[List[str]] = None,  # per resource
-        endpoint_sensitivity: str = "public",
-    ) -> ScanResult:
-        result: ScanResult = {
-            "resource": resource.endpoint,
-            "object_id": str(object_id),
-            "method": method.upper(),
-            "status": "UNKNOWN",
-            "severity": "INFO",
-            "confidence": 0.0,
-            "risk_score": 0.0,
-            "authorization_verdict": "INCONCLUSIVE",
-            "details": [],
-            "evidence": {},
-            "statistics": {
-                "vulnerabilities_found": 0,
-                "responses_analyzed": 0,
-                "response_details": [],
-                "scan_summary": "",
-                "total_time": 0.0,
-                "avg_response_time": 0.0,
-                "failed_requests": 0,
-            },
-        }
-
-        start_time = time.time()
-        response_times = []
-
-        # التحقق من صحة المدخلات
-        if "{id}" not in resource.endpoint:
-            return self._fail(result, "INVALID_INPUT", "Endpoint must contain '{id}' placeholder")
-        if not str(object_id).strip():
-            return self._fail(result, "INVALID_INPUT", "Object ID cannot be empty")
-        if method.upper() in ["DELETE", "PUT"] and not request_body:
-            result["details"].append("Warning: Destructive method used without body.")
-
-        url = self._build_url(resource.endpoint, object_id)
-        logger.info(f"Scanning URL: {url} with method: {method.upper()}")
-
-        if custom_risk_factors:
-            self.risk_factors.update(custom_risk_factors)
-        if custom_nested_paths:
-            self.nested_ownership_paths.extend(custom_nested_paths)
-
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.timeout)) as session:
-            # 1️⃣ Baseline – User A (owner)
-            resp_a = await self._send_request(session, url, method, user_a, request_body, custom_headers, result)
-            if not resp_a:
-                error_cat = self._categorize_error(None, None)
-                result["details"].append(f"Baseline failed: {error_cat}")
-                result["statistics"]["failed_requests"] += 1
-                result["statistics"]["scan_summary"] = "Failed to get baseline response."
-                result["statistics"]["total_time"] = time.time() - start_time
-                return result
-
-            result["statistics"]["responses_analyzed"] += 1
-            result["statistics"]["response_details"].append({
-                "user": "user_a",
-                "status_code": resp_a.status,
-                "content_length": self._get_data_size(resp_a),
-                "content_type": resp_a.headers.get("content-type", "unknown"),
-            })
-
-            # Handle 401, 403, 404 errors
-            if resp_a.status == 401:
-                return self._fail(result, "INVALID_AUTH", "User A authentication failed")
-            if resp_a.status in (403, 404):
-                return self._fail(result, "OBJECT_PROTECTED", f"Owner access blocked ({resp_a.status})")
-            if resp_a.status not in (200, 201, 202):
-                return self._fail(result, "UNKNOWN_BASELINE", f"Unexpected baseline status {resp_a.status}")
-
-            # 2️⃣ Ownership auto-detection
-            resp_a_data = await resp_a.json() if "json" in resp_a.headers.get("content-type", "") else {}
-            owner_id = self._detect_owner(resp_a_data)
-            result["evidence"]["detected_owner_id"] = owner_id
-
-            if owner_id and user_a.user_id and owner_id != user_a.user_id:
-                return self._fail(result, "OWNER_MISMATCH", "Object does not belong to baseline user")
-
-            # 3️⃣ JWT decoding with per-resource algorithms
-            jwt_info_a = self._extract_jwt_info(user_a, jwt_algorithms)
-            jwt_info_b = self._extract_jwt_info(user_b, jwt_algorithms)
-
-            # 4️⃣ Attack simulation – User B
-            resp_b = await self._send_request(session, url, method, user_b, request_body, custom_headers, result)
-            if not resp_b:
-                error_cat = self._categorize_error(None, resp_b.status if resp_b else None)
-                result["details"].append(f"User B request failed: {error_cat}")
-                result["statistics"]["failed_requests"] += 1
-                result["statistics"]["scan_summary"] = "Failed to get attacker response."
-                result["statistics"]["total_time"] = time.time() - start_time
-                return result
-
-            result["statistics"]["responses_analyzed"] += 1
-            result["statistics"]["response_details"].append({
-                "user": "user_b",
-                "status_code": resp_b.status,
-                "content_length": self._get_data_size(resp_b),
-                "content_type": resp_b.headers.get("content-type", "unknown"),
-            })
-
-            # 5️⃣ Decision logic with enhanced analysis
-            resp_b_data = await resp_b.json() if "json" in resp_b.headers.get("content-type", "") else {}
-            is_owner_a = self._evaluate_ownership(resp_a_data, user_a.user_id, jwt_info_a.get("subject"), jwt_info_a.get("roles"))
-            is_owner_b = self._evaluate_ownership(resp_b_data, user_b.user_id, jwt_info_b.get("subject"), jwt_info_b.get("roles"))
-
-            verdict = await self._responses_identical(resp_a, resp_b, custom_ignored, is_owner_a, is_owner_b)
-            result["authorization_verdict"] = verdict
-
-            # Risk score with all factors
-            data_size = self._get_data_size(resp_a)
-            exposed_fields = len(resp_a_data) if isinstance(resp_a_data, dict) else 0
-            risk_score = self._calculate_risk_score(
-                method, resp_a.status, resp_b.status, user_a.role, user_b.role, 
-                resp_a.headers.get("content-type", ""), data_size, criticality, impact, 
-                exploitability, exposed_fields, endpoint_sensitivity
-            )
-            result["risk_score"] = risk_score
-
-            if verdict == "DENY" and not is_owner_b:
-                result["status"] = "CONFIRMED_BOLA"
-                result["severity"] = "CRITICAL"
-                result["confidence"] = min(0.95 * risk_score / 10, 1.0)
-                result["details"].append("User B accessed identical resource owned by
+        auth_context: AuthContext,
+        object_id: str,
+        method: str
+    ) -> Dict[str, Any]:
+        """Make HTTP request"""
+        async with self.semaphore:
+            await asyncio.sleep(self.rate_limit)
+            
+            url = resource.build_url(self.base_url, object_id)
+            headers = auth_context.all_headers()
+            
+            try:
+                if method == "GET":
+                    async with self.session.get(url, headers=headers) as resp:
+                        body = await resp.json() if resp.content_type == 'application/json' else {}
+                        return {
+                            "status": resp.status,
+                            "body": body,
+                            "headers": dict(resp.headers)
+                        }
+                # Add other methods as needed
+                else:
+                    async with self.session.get(url, headers=headers) as resp:
+                        body = await resp.json() if resp.content_type == 'application/json' else {}
+                        return {
+                            "status": resp.status,
+                            "body": body,
+                            "headers": dict(resp.headers)
+                        }
+            except Exception as e:
+                return {
+                    "status": 0,
+                    "body": {},
+                    "error": str(e)
+                }
+    
+    def _is_vulnerable(
+        self,
+        response_a: Dict[str, Any],
+        response_b: Dict[str, Any],
+        resource: ApiResource
+    ) -> bool:
+        """Check if BOLA vulnerability exists"""
+        
+        # If status codes are different, might be OK
+        if response_a.get("status") != response_b.get("status"):
+            return False
+        
+        # If both returned success (2xx)
+        if 200 <= response_a.get("status", 0) < 300:
+            # Check if responses are similar
+            return self._responses_similar(response_a.get("body", {}), response_b.get("body", {}))
+        
+        return False
+    
+    def _responses_similar(self, body_a: Dict, body_b: Dict, threshold: float = 0.8) -> bool:
+        """Check if two responses are similar"""
+        # Simple implementation - compare JSON strings
+        import difflib
+        str_a = json.dumps(body_a, sort_keys=True)
+        str_b = json.dumps(body_b, sort_keys=True)
+        similarity = difflib.SequenceMatcher(None, str_a, str_b).ratio()
+        return similarity >= threshold
+    
+    def _extract_ids_from_response(self, body: Any) -> List[str]:
+        """Extract IDs from response body"""
+        ids = []
+        
+        if isinstance(body, list):
+            for item in body[:10]:  # Limit
+                if isinstance(item, dict) and "id" in item:
+                    ids.append(str(item["id"]))
+        elif isinstance(body, dict) and "data" in body and isinstance(body["data"], list):
+            for item in body["data"][:10]:
+                if isinstance(item, dict) and "id" in item:
+                    ids.append(str(item["id"]))
+        
+        return ids
+    
+    def _create_finding(
+        self,
+        resource: ApiResource,
+        object_id: str,
+        method: str,
+        response_a: Dict[str, Any],
+        response_b: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Create finding dictionary"""
+        return {
+            "resource": resource.name,
+            "endpoint": resource.endpoint,
+            "object_id": object_id,
+            "method": method,
+            "issue": "cross_user_access",
+            "severity": "critical",
+            "confidence": 80,
+            "details": {
+                "response_a_status": response_a.get("status"),
+                "response_b_status": response_b.get("status"),
+                "similarity": self._responses_similar(response_a.get("body", {}), response_b.get("body", {}))
+            }
+                            }
