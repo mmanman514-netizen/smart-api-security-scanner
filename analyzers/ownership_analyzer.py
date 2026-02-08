@@ -3,104 +3,197 @@ import logging
 from typing import List, Optional, Dict, Any
 from models.api_resource import ApiResource, ResourceType
 
-# Logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class OwnershipAnalyzer:
     """
-    Analyze API resources to detect BOLA / IDOR risks.
+    Analyze API resources to detect BOLA / IDOR risks with enhanced features.
     
-    This analyzer focuses on user-owned resources, checks for object identifiers,
-    sensitive operations, and adds risk flags accordingly. Designed for authorized
-    security testing only; unauthorized use violates laws.
+    Features:
+    - Automatic risk flagging for user-owned resources
+    - Customizable risk thresholds
+    - Async support for large datasets
+    - Integration with scanning workflows
     
     Example:
+        # After Swagger discovery
+        resources = discovery.parse_paths(spec)
+        
+        # Analyze for risks
         analyzer = OwnershipAnalyzer()
-        analyzer.analyze(resources)
-        # Check resource.risk_flags for added flags
+        metrics = analyzer.analyze(resources)
+        
+        # Use results for targeted scanning
+        high_risk = [r for r in resources if r.has_risk_flag("POTENTIAL_BOLA")]
     """
 
     def __init__(
         self,
-        custom_risk_thresholds: Optional[Dict[str, int]] = None,  # Custom thresholds for risks
-        enable_detailed_logging: bool = True,  # Enable detailed logging
+        custom_risk_thresholds: Optional[Dict[str, Any]] = None,
+        enable_detailed_logging: bool = True,
+        default_sample_data: Optional[Dict[str, Any]] = None,
     ):
-        self.custom_risk_thresholds = custom_risk_thresholds or {}
+        self.custom_risk_thresholds = custom_risk_thresholds or {
+            "exposed_fields": 3,
+            "sensitive_methods": 2,
+        }
         self.enable_detailed_logging = enable_detailed_logging
+        self.default_sample_data = default_sample_data or {}
+        
+        # تعريف risk flags مع وصف
+        self.risk_flag_descriptions = {
+            "NO_OBJECT_IDENTIFIER": "Resource lacks owner_field for BOLA detection",
+            "POTENTIAL_BOLA": "User-owned resource with sensitive methods",
+            "OBJECT_MODIFICATION": "Resource supports PUT/PATCH/DELETE methods",
+            "MULTI_TENANT_RISK": "Multi-tenant resource may have isolation issues",
+            "ADMIN_ONLY_RISK": "Admin-only endpoint privilege escalation risk",
+            "HIGH_EXPOSURE": "Exposes many sensitive fields",
+        }
 
     def analyze(self, resources: List[ApiResource]) -> Dict[str, Any]:
         """
-        Analyze a list of API resources for BOLA/IDOR risks.
+        Analyze API resources for security risks.
         
-        :param resources: List of ApiResource objects to analyze.
-        :return: Metrics dictionary with analysis results.
+        Args:
+            resources: List of ApiResource objects
+            
+        Returns:
+            Dictionary with analysis metrics
+            
+        Raises:
+            ValueError: If resources is not a list of ApiResource
         """
-        if not isinstance(resources, list) or not all(isinstance(r, ApiResource) for r in resources):
-            raise ValueError("Resources must be a list of ApiResource objects")
+        if not isinstance(resources, list):
+            raise ValueError("Resources must be a list")
+        
+        if not all(isinstance(r, ApiResource) for r in resources):
+            raise ValueError("All items must be ApiResource instances")
         
         metrics = {
             "total_resources": len(resources),
-            "analyzed_resources": 0,
+            "user_owned_resources": 0,
+            "public_resources": 0,
+            "admin_resources": 0,
             "risk_flags_added": 0,
             "bola_risks": 0,
+            "modification_risks": 0,
+            "resource_types": {},
         }
         
         for resource in resources:
             self._analyze_resource(resource, metrics)
         
-        logger.info(f"Analysis complete: {metrics}")
+        # تحليل إحصائي
+        self._calculate_statistics(metrics)
+        
+        if self.enable_detailed_logging:
+            logger.info(f"📊 Analysis complete: {metrics}")
+        
         return metrics
 
-    async def analyze_async(self, resources: List[ApiResource]) -> Dict[str, Any]:
-        """Async version for large lists."""
-        # Simple async wrapper; can be enhanced with parallel processing
-        return await asyncio.get_event_loop().run_in_executor(None, self.analyze, resources)
-
     def _analyze_resource(self, resource: ApiResource, metrics: Dict[str, Any]) -> None:
-        """Analyze a single resource."""
-        metrics["analyzed_resources"] += 1
+        """Analyze a single resource with comprehensive checks."""
         
-        # 🔒 Analyze only user-owned resources
+        # تحديث إحصائيات أنواع الموارد
+        resource_type = resource.resource_type.value
+        metrics["resource_types"][resource_type] = metrics["resource_types"].get(resource_type, 0) + 1
+        
+        # 🔒 التركيز على موارد user-owned فقط لـBOLA
         if resource.resource_type != ResourceType.USER_OWNED:
-            if self.enable_detailed_logging:
-                logger.debug(f"Skipping non-user-owned resource: {resource.name}")
+            if resource.resource_type == ResourceType.PUBLIC:
+                metrics["public_resources"] += 1
+            elif resource.resource_type == ResourceType.ADMIN_ONLY:
+                metrics["admin_resources"] += 1
             return
-
-        # 1️⃣ Check for Object Identifier
+        
+        metrics["user_owned_resources"] += 1
+        
+        # 1️⃣ تحقق من معرّف المالك (أساسي لـBOLA)
         if not resource.owner_field:
-            resource.add_risk_flag("NO_OBJECT_IDENTIFIER")
-            metrics["risk_flags_added"] += 1
-            if self.enable_detailed_logging:
-                logger.warning(f"No object identifier for {resource.name}")
+            self._add_risk_flag(resource, "NO_OBJECT_IDENTIFIER", metrics)
             return
 
-        # 2️⃣ Check for sensitive methods
+        # 2️⃣ تحقق من الطرق الحساسة
         sensitive_methods = {"GET", "PUT", "PATCH", "DELETE"}
-        if not any(m in sensitive_methods for m in resource.methods):
-            return
+        resource_methods = {m.upper() for m in resource.methods}
+        sensitive_found = resource_methods.intersection(sensitive_methods)
+        
+        if not sensitive_found:
+            return  # لا طرق حساسة، لا خطر BOLA
 
-        # 3️⃣ Potential BOLA risk
-        resource.add_risk_flag("POTENTIAL_BOLA")
-        metrics["risk_flags_added"] += 1
+        # 3️⃣ خطر BOLA محتمل
+        self._add_risk_flag(resource, "POTENTIAL_BOLA", metrics)
         metrics["bola_risks"] += 1
+        
         if self.enable_detailed_logging:
-            logger.info(f"Potential BOLA detected for {resource.name}")
+            logger.info(f"⚠️  Potential BOLA: {resource.name} ({resource.endpoint})")
 
-        # 4️⃣ Object modification risk
-        if any(m in {"PUT", "PATCH", "DELETE"} for m in resource.methods):
-            resource.add_risk_flag("OBJECT_MODIFICATION")
-            metrics["risk_flags_added"] += 1
+        # 4️⃣ خطر تعديل الكائن
+        modification_methods = {"PUT", "PATCH", "DELETE"}
+        if any(m in modification_methods for m in resource_methods):
+            self._add_risk_flag(resource, "OBJECT_MODIFICATION", metrics)
+            metrics["modification_risks"] += 1
 
-        # 5️⃣ Additional checks based on resource properties
-        if resource.multi_tenant:
-            resource.add_risk_flag("MULTI_TENANT_RISK")
-            metrics["risk_flags_added"] += 1
-        if resource.admin_only:
-            resource.add_risk_flag("ADMIN_ONLY_RISK")
-            metrics["risk_flags_added"] += 1
-        # تحسين: استخدم بيانات حقيقية إذا متوفرة، أو افترض 0 للبيانات الفارغة
-        exposed_count = resource.exposed_fields_count({})  # يمكن تمرير بيانات حقيقية هنا
-        if exposed_count > self.custom_risk_thresholds.get("exposed_fields", 0):
-            resource.add_risk_flag("HIGH_EXPOSURE")
-            metrics["risk_flags_added"] += 1
+        # 5️⃣ مخاطر إضافية بناءً على خصائص المورد
+        self._check_additional_risks(resource, metrics)
+
+    def _check_additional_risks(self, resource: ApiResource, metrics: Dict[str, Any]) -> None:
+        """Check for additional risk factors."""
+        try:
+            # استخدام الحقول الإضافية إذا كانت موجودة
+            if hasattr(resource, 'multi_tenant') and resource.multi_tenant:
+                self._add_risk_flag(resource, "MULTI_TENANT_RISK", metrics)
+            
+            if hasattr(resource, 'admin_only') and resource.admin_only:
+                self._add_risk_flag(resource, "ADMIN_ONLY_RISK", metrics)
+            
+            # حساب الحقول الحساسة المكشوفة
+            exposed_count = 0
+            if hasattr(resource, 'exposed_fields_count'):
+                # استخدام بيانات افتراضية أو حقيقية
+                sample_data = self.default_sample_data or {
+                    "dummy": "data",
+                    "email": "test@example.com" if "email" in resource.sensitive_fields else None
+                }
+                exposed_count = resource.exposed_fields_count(sample_data)
+            
+            threshold = self.custom_risk_thresholds.get("exposed_fields", 3)
+            if exposed_count > threshold:
+                self._add_risk_flag(resource, "HIGH_EXPOSURE", metrics)
+                
+        except AttributeError:
+            # إذا كانت الخصائص غير موجودة، تخطيها
+            pass
+
+    def _add_risk_flag(self, resource: ApiResource, flag: str, metrics: Dict[str, Any]) -> None:
+        """Add risk flag with description."""
+        resource.add_risk_flag(flag)
+        metrics["risk_flags_added"] += 1
+        
+        if self.enable_detailed_logging:
+            description = self.risk_flag_descriptions.get(flag, "Unknown risk")
+            logger.debug(f"  Added flag '{flag}': {description}")
+
+    def _calculate_statistics(self, metrics: Dict[str, Any]) -> None:
+        """Calculate additional statistics."""
+        total = metrics["total_resources"]
+        if total > 0:
+            metrics["bola_risk_percentage"] = (metrics["bola_risks"] / total) * 100
+            metrics["modification_risk_percentage"] = (metrics["modification_risks"] / total) * 100
+            metrics["avg_flags_per_resource"] = metrics["risk_flags_added"] / total
+
+    async def analyze_async(self, resources: List[ApiResource]) -> Dict[str, Any]:
+        """Async analysis with potential for parallel processing."""
+        # يمكن تحسين هذا لمعالجة الموازية للمجموعات الكبيرة
+        return await asyncio.to_thread(self.analyze, resources)
+    
+    def get_high_risk_resources(self, resources: List[ApiResource]) -> List[ApiResource]:
+        """Filter and return high-risk resources."""
+        high_risk = []
+        critical_flags = {"POTENTIAL_BOLA", "OBJECT_MODIFICATION"}
+        
+        for resource in resources:
+            if any(resource.has_risk_flag(flag) for flag in critical_flags):
+                high_risk.append(resource)
+        
+        return high_risk
