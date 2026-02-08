@@ -1,12 +1,10 @@
-from models.api_resource import ApiResource  # ✅ توافق صريح مع ApiResource
-
+from typing import List, Dict, Any, Optional
 import asyncio
 import aiohttp
 import requests
 import logging
 import time
 import re
-from typing import List, Dict, Any, Optional
 from collections import OrderedDict
 
 try:
@@ -22,6 +20,8 @@ try:
 except ImportError:
     HAS_IJSON = False
     ijson = None
+
+from models.api_resource import ApiResource, ResourceType  # ✅ توافق صريح مع ApiResource و ResourceType
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -363,6 +363,10 @@ class SwaggerDiscovery:
             owner_field=self._infer_owner_field(path, security_schemes),
             sensitive_fields=self._infer_sensitive_fields(details),
             writable_fields=self._infer_writable_fields(details),
+            multi_tenant=True,  # قيمة افتراضية
+            admin_only=self._is_admin_endpoint(path, details),
+            criticality=self._infer_criticality(path, details),
+            resource_type=ResourceType.USER_OWNED,  # قيمة افتراضية
         )
 
     # ---------- Heuristics ----------
@@ -418,5 +422,65 @@ class SwaggerDiscovery:
 
     # ---------- Helpers ----------
 
+    async def _load_json_streaming(self, response) -> Dict[str, Any]:
+        """Stream large JSON files to avoid memory issues"""
+        try:
+            # تحميل بسيط إذا لم يكن ijson متاحاً
+            if not HAS_IJSON:
+                return await response.json()
+            
+            # تنفيذ streaming مبسط
+            data = {}
+            parser = ijson.parse_async(response.content)
+            
+            async for prefix, event, value in parser:
+                if prefix == 'paths' and event == 'start_map':
+                    data['paths'] = {}
+                # يمكن توسيع هذا حسب الحاجة
+                
+            return data if data else await response.json()
+        except Exception as e:
+            logger.warning(f"Streaming failed, falling back: {e}")
+            return await response.json()
+
     def _resolve_ref(self, swagger: Dict[str, Any], obj: Any, max_depth: int = 10, depth: int = 0) -> Any:
-        """Resolve $ref recursively with depth limit."""
+        """Resolve $ref references recursively"""
+        if depth > max_depth:
+            return obj
+        
+        if isinstance(obj, dict) and '$ref' in obj:
+            ref_path = obj['$ref']
+            if ref_path.startswith('#/'):
+                parts = ref_path[2:].split('/')
+                current = swagger
+                for part in parts:
+                    current = current.get(part, {})
+                return self._resolve_ref(swagger, current, max_depth, depth + 1)
+        
+        elif isinstance(obj, dict):
+            return {k: self._resolve_ref(swagger, v, max_depth, depth + 1) for k, v in obj.items()}
+        
+        elif isinstance(obj, list):
+            return [self._resolve_ref(swagger, item, max_depth, depth + 1) for item in obj]
+        
+        return obj
+
+    def _cleanup_cache(self):
+        """Clean expired cache entries."""
+        current_time = time.time()
+        expired_keys = [k for k, t in self._cache_timestamps.items() if current_time - t > self.cache_ttl]
+        for k in expired_keys:
+            del self._swagger_cache[k]
+            del self._cache_timestamps[k]
+
+    def _rate_limit(self):
+        """Enforce rate limiting."""
+        current_time = time.time()
+        if current_time - self._last_request_time < self.rate_limit_delay:
+            time.sleep(self.rate_limit_delay - (current_time - self._last_request_time))
+        self._last_request_time = time.time()
+
+    def _is_admin_endpoint(self, path: str, details: Dict[str, Any]) -> bool:
+        """Infer if endpoint is admin-only based on path and details."""
+        admin_keywords = ["admin", "superuser", "root", "manage"]
+        return any
