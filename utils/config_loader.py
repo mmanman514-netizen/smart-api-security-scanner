@@ -33,24 +33,7 @@ class ConfigLoader:
         if not path.exists():
             raise FileNotFoundError(f"Config file not found: {file_path}")
         
-        # قراءة الملف بناءً على نوعه
-        if path.suffix.lower() in ['.json', '.json5']:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-        elif path.suffix.lower() in ['.yaml', '.yml']:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f)
-        else:
-            # محاولة التخمين
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-            except:
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        config = yaml.safe_load(f)
-                except:
-                    raise ValueError(f"Unsupported config format: {file_path}")
+        config = ConfigLoader._load_raw_config(file_path)
         
         # التحقق من الإصدار
         version = config.get("version", "1.0")
@@ -63,6 +46,22 @@ class ConfigLoader:
             ConfigLoader._validate_config(config)
         
         return config
+
+    @staticmethod
+    def _load_raw_config(file_path: str) -> Dict[str, Any]:
+        """قراءة ملف التكوين بشكل مباشر وبصيغة صارمة."""
+        path = Path(file_path)
+
+        if path.suffix.lower() in ['.json']:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                # Strict JSON only (comments are not supported)
+                return json.load(f)
+
+        if path.suffix.lower() in ['.yaml', '.yml']:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f)
+
+        raise ValueError("Unsupported config format. Use JSON or YAML.")
     
     @staticmethod
     def _convert_v2_to_v1(config_v2: Dict[str, Any]) -> Dict[str, Any]:
@@ -195,13 +194,49 @@ class ConfigLoader:
             raise ValueError(f"Config validation failed: {'; '.join(errors)}")
         
         print("✅ Configuration validated successfully")
+
+    @staticmethod
+    def _validate_resources(resources: Any):
+        """التحقق من صحة قسم الموارد."""
+        if not isinstance(resources, list):
+            raise ValueError("'resources' must be a list")
+
+        for resource in resources:
+            if not isinstance(resource, dict):
+                raise ValueError("Each resource must be an object")
+
+            resource_path = resource.get("path") or resource.get("endpoint")
+            if resource_path is None:
+                raise ValueError("Each resource must define 'path' or 'endpoint'")
+
+            if not isinstance(resource_path, str):
+                raise ValueError("Resource 'path' must be a string")
+
+            placeholders = re.findall(r"\{([^}]+)\}", resource_path)
+            if not placeholders:
+                raise ValueError(
+                    f"Resource path must contain at least one placeholder: {resource_path}"
+                )
+
+            object_id_regex = resource.get("object_id_regex")
+            if object_id_regex is not None:
+                try:
+                    re.compile(object_id_regex)
+                except re.error as exc:
+                    raise ValueError(
+                        f"Invalid object_id_regex in resource {resource_path}"
+                    ) from exc
     
     @staticmethod
     def load_resources(file_path: str) -> List[Dict[str, Any]]:
         """تحميل الموارد من ملف التكوين v2.1"""
-        config = ConfigLoader.load(file_path, validate=False)
-        
+        config = ConfigLoader._load_raw_config(file_path)
+
+        if "resources" not in config:
+            raise ValueError("Missing 'resources' section in config")
+
         resources = config.get("resources", [])
+        ConfigLoader._validate_resources(resources)
         converted_resources = []
         
         for resource in resources:
