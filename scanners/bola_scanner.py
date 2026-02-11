@@ -1,9 +1,11 @@
 import asyncio
-import aiohttp
+try:
+    import aiohttp
+except ImportError:  # pragma: no cover - dependency may be unavailable in dry-run mode
+    aiohttp = None
 import json
 import logging
 import time
-import hashlib
 import random
 import re
 import uuid
@@ -43,6 +45,8 @@ class BOLAScanner:
         self.start_time = None
         
     async def __aenter__(self):
+        if aiohttp is None:
+            raise RuntimeError("aiohttp is required for active scanning")
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         connector = aiohttp.TCPConnector(ssl=False)  # أو True إذا كنت تريد SSL
         self.session = aiohttp.ClientSession(
@@ -70,30 +74,51 @@ class BOLAScanner:
         """
         self.start_time = time.time()
         findings = []
-        
+
         if not auth_contexts or len(auth_contexts) < 2:
             raise ValueError("BOLA scan requires at least 2 auth contexts")
-        
+
         logger.info(f"Starting BOLA scan with {len(resources)} resources")
-        
-        for resource in resources:
-            if dry_run:
+
+        if dry_run:
+            for resource in resources:
                 logger.info(f"Dry run: {resource.get('name')} - {resource.get('endpoint')}")
-                continue
-            
-            # التحقق من حدود السلامة
-            if self._safety_check_failed():
-                logger.warning("Safety check failed, stopping scan")
-                break
-            
-            try:
-                resource_findings = await self._scan_resource(resource, auth_contexts)
-                findings.extend(resource_findings)
-                
-            except Exception as e:
-                logger.error(f"Error scanning {resource.get('name')}: {e}")
-                self.error_count += 1
-        
+            logger.info(f"BOLA scan completed. Findings: {len(findings)}")
+            return findings
+
+        if aiohttp is None:
+            raise RuntimeError("aiohttp is required for active scanning")
+
+        session_owned_by_scan = False
+        if self.session is None or self.session.closed:
+            timeout = aiohttp.ClientTimeout(total=self.timeout)
+            connector = aiohttp.TCPConnector(ssl=False)  # أو True إذا كنت تريد SSL
+            self.session = aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector,
+                headers=self.default_headers
+            )
+            session_owned_by_scan = True
+
+        try:
+            for resource in resources:
+
+                # التحقق من حدود السلامة
+                if self._safety_check_failed():
+                    logger.warning("Safety check failed, stopping scan")
+                    break
+
+                try:
+                    resource_findings = await self._scan_resource(resource, auth_contexts)
+                    findings.extend(resource_findings)
+
+                except Exception as e:
+                    logger.error(f"Error scanning {resource.get('name')}: {e}")
+                    self.error_count += 1
+        finally:
+            if session_owned_by_scan and self.session and not self.session.closed:
+                await self.session.close()
+
         logger.info(f"BOLA scan completed. Findings: {len(findings)}")
         return findings
     
