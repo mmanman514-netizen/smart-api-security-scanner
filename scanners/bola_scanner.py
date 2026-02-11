@@ -35,6 +35,7 @@ class BOLAScanner:
         self.user_pairs = user_pairs or []
         self.safety_config = safety_config or {}
         self.session = None
+        self._session_owner = False
         self.default_headers = {}
         
         # إحصائيات السلامة
@@ -50,11 +51,24 @@ class BOLAScanner:
             connector=connector,
             headers=self.default_headers
         )
+        self._session_owner = True
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
-            await self.session.close()
+        await self.close()
+
+    async def _ensure_session(self) -> None:
+        """ضمان وجود HTTP session حتى بدون استخدام context manager"""
+        if self.session is None or self.session.closed:
+            logger.warning("Session was not initialized via context manager. Creating lazily.")
+            timeout = aiohttp.ClientTimeout(total=self.timeout)
+            connector = aiohttp.TCPConnector(ssl=False)
+            self.session = aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector,
+                headers=self.default_headers
+            )
+            self._session_owner = True
     
     async def scan(
         self,
@@ -224,10 +238,11 @@ class BOLAScanner:
         url: str,
         method: str,
         headers: Dict[str, str]
-    ) -> Dict[str, Any]:
+    ) -> Optional[Dict[str, Any]]:
         """إرسال طلب HTTP"""
         async with self.semaphore:
             await asyncio.sleep(self.rate_limit)
+            await self._ensure_session()
             
             full_url = f"{self.base_url}{url}" if not url.startswith("http") else url
             
@@ -250,11 +265,8 @@ class BOLAScanner:
                         
             except Exception as e:
                 self.error_count += 1
-                return {
-                    "status": 0,
-                    "error": str(e),
-                    "body": {}
-                }
+                logger.error(f"Request failed for {full_url}: {e}")
+                return None
     
     async def _process_response(self, response) -> Dict[str, Any]:
         """معالجة الاستجابة"""
@@ -279,12 +291,16 @@ class BOLAScanner:
     
     def _is_vulnerable(
         self,
-        response_a: Dict[str, Any],
-        response_b: Dict[str, Any],
+        response_a: Optional[Dict[str, Any]],
+        response_b: Optional[Dict[str, Any]],
         auth_a: Dict[str, Any],
         auth_b: Dict[str, Any]
     ) -> bool:
         """التحقق من وجود ثغرة BOLA"""
+
+        if response_a is None or response_b is None:
+            logger.warning("Inconclusive test due to request failure.")
+            return False
         
         # إذا كان المستخدم الثاني له صلاحيات أعلى، قد يكون طبيعياً
         if self._is_higher_privilege(auth_b, auth_a):
@@ -303,6 +319,13 @@ class BOLAScanner:
             return True
         
         return False
+
+    async def close(self) -> None:
+        """تنظيف session المفتوحة"""
+        if self._session_owner and self.session and not self.session.closed:
+            await self.session.close()
+            self.session = None
+            self._session_owner = False
     
     def _is_higher_privilege(self, auth1: Dict[str, Any], auth2: Dict[str, Any]) -> bool:
         """التحقق إذا كانت صلاحيات auth1 أعلى من auth2"""
