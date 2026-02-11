@@ -283,23 +283,38 @@ class BOLAScanner:
         response_b: Dict[str, Any],
         auth_a: Dict[str, Any],
         auth_b: Dict[str, Any]
-    ) -> bool:
-        """التحقق من وجود ثغرة BOLA"""
+    ) -> Optional[bool]:
+        """التحقق من وجود ثغرة BOLA
+
+        Returns:
+            True  -> confirmed BOLA
+            False -> not vulnerable
+            None  -> inconclusive
+        """
         
         # إذا كان المستخدم الثاني له صلاحيات أعلى، قد يكون طبيعياً
         if self._is_higher_privilege(auth_b, auth_a):
             return False
-        
-        # إذا فشل كلا الطلبين
-        if response_a.get("status", 0) < 200 or response_b.get("status", 0) < 200:
+
+        # إذا فشل أي طلب
+        if response_a is None or response_b is None:
+            logger.warning("Inconclusive: request failure.")
+            return None
+
+        status_a = response_a.get("status", 0)
+        status_b = response_b.get("status", 0)
+
+        # baseline (user_a) يجب أن ينجح
+        if not (200 <= status_a < 300):
+            logger.warning("Baseline user does not successfully access object. Inconclusive.")
+            return None
+
+        # challenger (user_b) لم ينجح => ليست BOLA
+        if not (200 <= status_b < 300):
             return False
-        
+
         # إذا كان الردان متطابقين أو متشابهين جداً
         if self._responses_similar(response_a, response_b):
-            # ولكن يجب أن يكون user_a يملك المورد
-            if response_a.get("status", 0) >= 400:
-                return False
-                
             return True
         
         return False
