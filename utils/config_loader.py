@@ -3,10 +3,12 @@
 """
 
 import json
-import yaml
+try:
+    import yaml
+except ImportError:  # pragma: no cover - YAML support is optional at runtime
+    yaml = None
 import os
 import re
-import sys
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 import uuid
@@ -33,24 +35,26 @@ class ConfigLoader:
         if not path.exists():
             raise FileNotFoundError(f"Config file not found: {file_path}")
         
+        raw_content = path.read_text(encoding='utf-8')
+
         # قراءة الملف بناءً على نوعه
         if path.suffix.lower() in ['.json', '.json5']:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                config = json.load(f)
+            config = ConfigLoader._load_json_with_comments(raw_content, file_path)
         elif path.suffix.lower() in ['.yaml', '.yml']:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f)
+            if yaml is None:
+                raise RuntimeError("PyYAML is required to load YAML configuration files")
+            config = yaml.safe_load(raw_content)
         else:
             # محاولة التخمين
             try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-            except:
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        config = yaml.safe_load(f)
-                except:
+                config = ConfigLoader._load_json_with_comments(raw_content, file_path)
+            except ValueError:
+                if yaml is None:
                     raise ValueError(f"Unsupported config format: {file_path}")
+                try:
+                    config = yaml.safe_load(raw_content)
+                except yaml.YAMLError as exc:
+                    raise ValueError(f"Unsupported config format: {file_path}") from exc
         
         # التحقق من الإصدار
         version = config.get("version", "1.0")
@@ -63,6 +67,66 @@ class ConfigLoader:
             ConfigLoader._validate_config(config)
         
         return config
+
+    @staticmethod
+    def _load_json_with_comments(raw_content: str, file_path: str) -> Dict[str, Any]:
+        """Load JSON content while allowing // and /* */ comments."""
+        try:
+            return json.loads(raw_content)
+        except json.JSONDecodeError:
+            cleaned = ConfigLoader._strip_json_comments(raw_content)
+            try:
+                return json.loads(cleaned)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON config in {file_path}: {exc}") from exc
+
+    @staticmethod
+    def _strip_json_comments(content: str) -> str:
+        """Strip JSON comments without altering string literals."""
+        result = []
+        in_string = False
+        escaped = False
+        i = 0
+        length = len(content)
+
+        while i < length:
+            char = content[i]
+            nxt = content[i + 1] if i + 1 < length else ""
+
+            if in_string:
+                result.append(char)
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                i += 1
+                continue
+
+            if char == '"':
+                in_string = True
+                result.append(char)
+                i += 1
+                continue
+
+            if char == '/' and nxt == '/':
+                i += 2
+                while i < length and content[i] not in ('\n', '\r'):
+                    i += 1
+                continue
+
+            if char == '/' and nxt == '*':
+                i += 2
+                while i + 1 < length and not (content[i] == '*' and content[i + 1] == '/'):
+                    i += 1
+                i += 2 if i + 1 < length else 1
+                continue
+
+            result.append(char)
+            i += 1
+
+        return ''.join(result)
     
     @staticmethod
     def _convert_v2_to_v1(config_v2: Dict[str, Any]) -> Dict[str, Any]:

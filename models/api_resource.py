@@ -1,4 +1,5 @@
-from typing import List, Optional, Dict, Any, Callable, Set, Enum
+from typing import List, Optional, Dict, Any, Callable, Set
+from enum import Enum
 import re
 import json
 from functools import lru_cache
