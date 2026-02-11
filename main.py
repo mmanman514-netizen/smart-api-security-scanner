@@ -113,11 +113,12 @@ class SecurityAPIScanner:
             scanner = self.scanners["bola"]
             
             # تشغيل المسح
-            findings = await scanner.scan(
-                resources=self.resources,
-                auth_contexts=self.auth_contexts,
-                dry_run=False
-            )
+            async with scanner:
+                findings = await scanner.scan(
+                    resources=self.resources,
+                    auth_contexts=self.auth_contexts,
+                    dry_run=False
+                )
             
             self.findings = findings
             
