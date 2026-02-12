@@ -242,11 +242,11 @@ class BOLAScanner:
         """إرسال طلب HTTP"""
         async with self.semaphore:
             await asyncio.sleep(self.rate_limit)
-            await self._ensure_session()
-            
             full_url = f"{self.base_url}{url}" if not url.startswith("http") else url
-            
+
             try:
+                await self._ensure_session()
+
                 if method == "GET":
                     async with self.session.get(full_url, headers=headers) as resp:
                         return await self._process_response(resp)
@@ -259,10 +259,10 @@ class BOLAScanner:
                 elif method == "DELETE":
                     async with self.session.delete(full_url, headers=headers) as resp:
                         return await self._process_response(resp)
-                else:
-                    async with self.session.get(full_url, headers=headers) as resp:
-                        return await self._process_response(resp)
-                        
+
+                async with self.session.get(full_url, headers=headers) as resp:
+                    return await self._process_response(resp)
+
             except Exception as e:
                 self.error_count += 1
                 logger.error(f"Request failed for {full_url}: {e}")
