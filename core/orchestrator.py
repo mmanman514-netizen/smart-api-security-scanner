@@ -1,6 +1,7 @@
 # core/orchestrator.py - الإصدار المصحح
 from typing import List, Dict, Any
 import logging
+import time
 
 # استيرادات آمنة مع fallback
 try:
@@ -86,7 +87,7 @@ class ScanOrchestrator:
         
         try:
             # تنفيذ المسح
-            start_time = time.time() if 'time' in globals() else None
+            start_time = time.time()
             
             findings = await self.scanner.scan(
                 resources=self.resources,
@@ -95,9 +96,8 @@ class ScanOrchestrator:
             )
             
             # حساب الإحصائيات
-            if start_time and 'time' in globals():
-                duration = time.time() - start_time
-                logger.info(f"⏱️  Scan completed in {duration:.2f} seconds")
+            duration = time.time() - start_time
+            logger.info(f"⏱️  Scan completed in {duration:.2f} seconds")
             
             # تسجيل النتائج
             if not findings:

@@ -19,6 +19,7 @@ class BOLAScanner:
         self,
         base_url: str = "",
         rate_limit: float = 1.0,
+        requests_per_second: Optional[float] = None,
         max_concurrent: int = 5,
         timeout: int = 30,
         strict_owner: bool = False,
@@ -27,7 +28,15 @@ class BOLAScanner:
         safety_config: Dict[str, Any] = None
     ):
         self.base_url = base_url
-        self.rate_limit = rate_limit if rate_limit is not None else 0
+        # NOTE: v2.1 config exposes requests_per_second while older code used
+        # `rate_limit`. Normalize both to an inter-request delay in seconds.
+        effective_rps = requests_per_second if requests_per_second is not None else rate_limit
+        self.request_delay = 0.0
+        try:
+            if effective_rps and float(effective_rps) > 0:
+                self.request_delay = 1.0 / float(effective_rps)
+        except (TypeError, ValueError):
+            logger.warning("Invalid rate limit value. Falling back to no delay.")
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.timeout = timeout
         self.strict_owner = strict_owner
@@ -241,7 +250,9 @@ class BOLAScanner:
     ) -> Optional[Dict[str, Any]]:
         """إرسال طلب HTTP"""
         async with self.semaphore:
-            await asyncio.sleep(self.rate_limit or 0)
+            if self.request_delay > 0:
+                await asyncio.sleep(self.request_delay)
+            
             full_url = f"{self.base_url}{url}" if not url.startswith("http") else url
 
             try:
@@ -305,17 +316,26 @@ class BOLAScanner:
         # إذا كان المستخدم الثاني له صلاحيات أعلى، قد يكون طبيعياً
         if self._is_higher_privilege(auth_b, auth_a):
             return False
-        
-        # إذا فشل كلا الطلبين
-        if response_a.get("status", 0) < 200 or response_b.get("status", 0) < 200:
+
+        # إذا فشل أي طلب
+        if response_a is None or response_b is None:
+            logger.warning("Inconclusive: request failure.")
+            return None
+
+        status_a = response_a.get("status", 0)
+        status_b = response_b.get("status", 0)
+
+        # baseline (user_a) يجب أن ينجح
+        if not (200 <= status_a < 300):
+            logger.warning("Baseline user does not successfully access object. Inconclusive.")
+            return None
+
+        # challenger (user_b) لم ينجح => ليست BOLA
+        if not (200 <= status_b < 300):
             return False
-        
+
         # إذا كان الردان متطابقين أو متشابهين جداً
         if self._responses_similar(response_a, response_b):
-            # ولكن يجب أن يكون user_a يملك المورد
-            if response_a.get("status", 0) >= 400:
-                return False
-                
             return True
         
         return False
