@@ -3,10 +3,7 @@
 """
 
 import json
-try:
-    import yaml
-except ImportError:  # pragma: no cover - YAML support is optional at runtime
-    yaml = None
+import yaml
 import os
 import re
 from typing import Dict, Any, List, Optional
@@ -41,16 +38,12 @@ class ConfigLoader:
         if path.suffix.lower() in ['.json', '.json5']:
             config = ConfigLoader._load_json_with_comments(raw_content, file_path)
         elif path.suffix.lower() in ['.yaml', '.yml']:
-            if yaml is None:
-                raise RuntimeError("PyYAML is required to load YAML configuration files")
             config = yaml.safe_load(raw_content)
         else:
             # محاولة التخمين
             try:
                 config = ConfigLoader._load_json_with_comments(raw_content, file_path)
             except ValueError:
-                if yaml is None:
-                    raise ValueError(f"Unsupported config format: {file_path}")
                 try:
                     config = yaml.safe_load(raw_content)
                 except yaml.YAMLError as exc:
