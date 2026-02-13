@@ -27,7 +27,7 @@ class BOLAScanner:
         safety_config: Dict[str, Any] = None
     ):
         self.base_url = base_url
-        self.rate_limit = rate_limit
+        self.rate_limit = rate_limit if rate_limit is not None else 0
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.timeout = timeout
         self.strict_owner = strict_owner
@@ -241,7 +241,7 @@ class BOLAScanner:
     ) -> Optional[Dict[str, Any]]:
         """إرسال طلب HTTP"""
         async with self.semaphore:
-            await asyncio.sleep(self.rate_limit)
+            await asyncio.sleep(self.rate_limit or 0)
             full_url = f"{self.base_url}{url}" if not url.startswith("http") else url
 
             try:
